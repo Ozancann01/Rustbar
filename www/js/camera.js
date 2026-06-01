@@ -32,20 +32,24 @@ export async function pickBestCameraDevice(excludeId) {
   return best?.cam.deviceId;
 }
 
+const FRAME_RATE_HINT = { ideal: 30, max: 30 };
+
 function buildVideoConstraints(deviceId) {
   const base = deviceId ? { deviceId: { exact: deviceId } } : {};
   const facing = { facingMode: { ideal: "environment" } };
+  const fps = { frameRate: FRAME_RATE_HINT };
   return [
-    { ...base, ...facing, width: { ideal: 3840 }, height: { ideal: 2160 } },
-    { ...base, ...facing, width: { ideal: 1920 }, height: { ideal: 1080 } },
+    { ...base, ...facing, ...fps, width: { ideal: 3840 }, height: { ideal: 2160 } },
+    { ...base, ...facing, ...fps, width: { ideal: 1920 }, height: { ideal: 1080 } },
     {
       ...base,
       ...facing,
+      ...fps,
       width: { min: 1920 },
       height: { min: 1080 },
     },
-    { ...facing, width: { ideal: 1920 }, height: { ideal: 1080 } },
-    { facingMode: "environment" },
+    { ...facing, ...fps, width: { ideal: 1920 }, height: { ideal: 1080 } },
+    { facingMode: "environment", ...fps },
   ];
 }
 
@@ -111,6 +115,52 @@ export async function applyResizeModeNone(stream) {
     await track.applyConstraints({ resizeMode: "none" });
   } catch {
     /* unsupported */
+  }
+}
+
+/**
+ * Center focus/exposure hint before a still capture (browser-native analogue of ROI lock).
+ */
+export async function applyCenterFocusHint(stream) {
+  const track = stream?.getVideoTracks()?.[0];
+  if (!track?.applyConstraints) return;
+
+  const advanced = [];
+  const caps = track.getCapabilities?.();
+  if (caps?.focusMode?.includes?.("single-shot")) {
+    advanced.push({ focusMode: "single-shot" });
+  } else if (caps?.focusMode?.includes?.("manual")) {
+    advanced.push({ focusMode: "manual" });
+  }
+  if (caps?.pointsOfInterest) {
+    advanced.push({ pointsOfInterest: [{ x: 0.5, y: 0.5 }] });
+  }
+  if (advanced.length > 0) {
+    try {
+      await track.applyConstraints({ advanced });
+    } catch {
+      /* unsupported */
+    }
+  }
+
+  await new Promise((r) => setTimeout(r, 300));
+
+  try {
+    await track.applyConstraints({
+      advanced: [
+        { focusMode: "continuous" },
+        { exposureMode: "continuous" },
+      ],
+    });
+  } catch {
+    try {
+      await track.applyConstraints({
+        focusMode: "continuous",
+        exposureMode: "continuous",
+      });
+    } catch {
+      /* unsupported */
+    }
   }
 }
 

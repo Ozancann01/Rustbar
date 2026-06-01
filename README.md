@@ -1,42 +1,39 @@
-# Rustbar — Live Barcode Scanner Library (Rust + WASM)
+# Rustbar — Browser Barcode Scanner (Rust + WASM)
 
-Embeddable browser library: call **`RustbarScanner.open()`** and it opens the camera, scans **QR codes** and **Data Matrix** live using Rust/WebAssembly ([rxing](https://github.com/rxing-core/rxing) / ZXing), and returns the decoded text to your app.
+Embeddable **browser** library: call **`RustbarScanner.open()`** and it opens the camera, scans **QR codes** and **Data Matrix** live using Rust/WebAssembly ([rxing](https://github.com/rxing-core/rxing)), and returns decoded text to your app.
 
-## Architecture
+**Demo:** [https://ozancann01.github.io/Rustbar/](https://ozancann01.github.io/Rustbar/)
 
-| Layer | Role |
-|-------|------|
-| **Rust / WASM** | Bilinear ROI crop/resize, luma, contrast stretch, multi-scale decode (rxing) |
-| **JS worker** | `decodeVideoFrame` + `decodeImageBytes` off the main thread |
-| **JS camera** | `getUserMedia`, min-resolution ladder, stream upgrade, focus, torch, lens pick |
-| **JS capture** | `ImageCapture.takePhoto()` high-res stills when supported |
-| **JS shell** | DOM overlay, `drawImage` → RGBA, optional `BarcodeDetector` fast path |
+Uses the browser’s **native camera APIs** (`getUserMedia`, `ImageCapture`, `MediaStreamTrack` constraints, optional `BarcodeDetector`) for the best quality possible in one web page—not a separate app install.
 
-Almost all scan logic is in [`scanner/src/lib.rs`](scanner/src/lib.rs). The camera must use browser APIs (JavaScript); Rust receives pixel buffers only.
+> **HTTPS + user gesture** required for camera access. Mobile browsers may cap live preview resolution; `ImageCapture` stills often provide more megapixels for decode.
 
-> **HTTPS + user gesture** are required for camera access. Mobile browsers often cap the **live preview** at 720p–1080p even when 4K is requested; `ImageCapture` can still deliver a larger still on many devices.
+## Scanbot web demo comparison
+
+[Scanbot’s browser demo](https://websdk-barcode.scanbot.io) and Rustbar both run in the mobile browser with the same class of APIs. Rustbar targets similar **camera + UX** (full-bleed preview, large finder, 4K stream negotiation, early high-res stills, result sheet)—not Scanbot’s proprietary WASM decoder.
+
+| Area | Scanbot Web SDK | Rustbar |
+|------|-----------------|---------|
+| Decoder | Proprietary WASM | **rxing** (open source; different accuracy ceiling) |
+| Preview UI | Full-screen, large finder | Full-bleed overlay + large finder |
+| Stream | Optional 4K + constraints | `use4KStream` + upgrade ladder |
+| Stills | `ImageCapture` | Mobile-first still (~800ms), 350ms interval |
+| After scan | Result card | Optional `showResultSheet` (default on mobile) |
 
 ## Features
 
-- **Library API** — `init()`, `open()`, `close()` with `onScan(text, format)` / `onError` callbacks
-- **Formats** — QR Code and Data Matrix (more symbologies later via `formats` option)
-- **Rust pipeline** — `decodeVideoFrame`: crop → bilinear resize → preprocess → multi-scale rxing decode
-- **High-res camera** — 4K→1080p→min-1080p constraint ladder; post-open upgrade if width &lt; 1280px; `resizeMode: none` when supported
-- **High-res stills** — periodic `ImageCapture` JPEG → `decodeImageBytes` in Rust
-- **Web Worker** — WASM runs off the main thread; flashlight in overlay
-- **Chrome fast path** — `BarcodeDetector` for QR when formats are QR-only
-- **Mobile** — continuous focus/exposure; `playsinline` for iOS
-
-## Prerequisites
-
-- [Rust](https://rustup.rs/)
-- [wasm-pack](https://rustwasm.github.io/wasm-pack/installer/)
+- **One-browser embed** — GitHub Pages, your site, or local HTTPS
+- **Rust decode** — bilinear ROI crop, multi-scale + rotation (preview 90°; stills +270°)
+- **Scan pipeline** — throttled preview (~14 Hz) → focus hint → max-res still (`detect → lock → snap`)
+- **High-res camera** — 4K→1080p→min-1080p ladder, stream upgrade, `resizeMode: none`
+- **ImageCapture** — mobile early still, periodic / miss-triggered JPEG decode
+- **Web Worker** — WASM off main thread; torch in overlay
+- **Chrome fast path** — `BarcodeDetector` on center finder crop (~1200px) for QR-only
 
 ## Build
 
 ```bash
-chmod +x build.sh
-./build.sh
+chmod +x build.sh && ./build.sh
 ```
 
 Outputs WASM to `www/pkg/`.
@@ -44,135 +41,81 @@ Outputs WASM to `www/pkg/`.
 ## Run locally
 
 ```bash
-cd www
-python -m http.server 8080
+cd www && python -m http.server 8080
 ```
 
-Open [http://localhost:8080](http://localhost:8080) and tap **Scan QR code**.
-
-Demo: [https://ozancann01.github.io/Rustbar/](https://ozancann01.github.io/Rustbar/) (deployed via GitHub Actions; see [`.github/workflows/pages.yml`](.github/workflows/pages.yml)).
+Open [http://localhost:8080](http://localhost:8080) (use HTTPS or localhost for camera).
 
 ## Library usage
 
-Copy these paths into your project (or serve them statically):
+Copy into your static host:
 
-- `www/js/rustbar.js` — thin API shell
-- `www/js/camera.js` — browser camera only
-- `www/js/capture.js` — ImageCapture stills
-- `www/js/decode-worker.js` — WASM loader
-- `www/js/scanner-ui.js`
+- `www/js/rustbar.js`, `camera.js`, `capture.js`, `scan-state.js`, `decode-worker.js`, `scanner-ui.js`
 - `www/css/scanner-overlay.css`
-- `www/pkg/` (generated by `./build.sh`)
+- `www/pkg/` (from `./build.sh`)
 
-### Vanilla JS
+```javascript
+import { RustbarScanner } from "./js/rustbar.js";
 
-```html
-<button id="scan">Scan</button>
-<script type="module">
-  import { RustbarScanner } from "./js/rustbar.js";
-
-  await RustbarScanner.init();
-
-  document.getElementById("scan").onclick = async () => {
-    const session = await RustbarScanner.open({
-      onScan(text, format) {
-        console.log(format, text);
-        session.close();
-      },
-      formats: ["qrcode", "datamatrix"],
-      prefer4K: true,
-      continuous: false,
-      closeOnScan: true,
-    });
-  };
-</script>
+await RustbarScanner.open({
+  onScan(text, format) { console.log(format, text); },
+  formats: ["qrcode", "datamatrix"],
+  prefer4K: true,
+  use4KStream: true,
+  recognitionResolution: 2048,
+  onCameraReady(info) {
+    console.log("preview", info.width, "x", info.height);
+    console.log("max still width", info.photoWidthMax);
+  },
+});
 ```
 
-### API
+### `open()` options
 
-| Method | Description |
-|--------|-------------|
-| `RustbarScanner.init()` | Load WASM once (optional; `open()` calls it automatically) |
-| `RustbarScanner.open(options)` | Full-screen scanner; returns `{ close() }` |
+| Option | Default | Description |
+|--------|---------|-------------|
+| `onScan` | required | `(text, format) => void` |
+| `onCameraReady` | — | `width`, `height`, `frameRate`, `imageCapture`, `photoWidthMax`, `recognitionResolution` |
+| `prefer4K` | `true` | Stronger `getUserMedia` constraints |
+| `use4KStream` | `true` when `prefer4K` | Re-negotiate stream if width &lt; 1920 |
+| `recognitionResolution` | `2048` | Decode size: `1536` / `2048` / `2560` (like Scanbot `setRecognitionResolution`) |
+| `decodeResolution` | — | Alias for `recognitionResolution` |
+| `highResStills` | `true` if supported | `ImageCapture` on timer / after misses |
+| `stillIntervalMs` | `350` mobile, `500` desktop | Min ms between still captures |
+| `mobileStillFirst` | `true` on mobile | Defer preview decode ~800ms; fire early still |
+| `showResultSheet` | `true` on mobile | Bottom card with thumbnail, Copy / Close |
+| `roiFraction` | `0.85` | Center crop (auto-expands to `0.92` after misses) |
+| `adaptiveDecode` | `false` | Drop to 1536px after slow frames if `true` |
+| `useWorker` | `true` | WASM in Web Worker |
+| `continuous` / `closeOnScan` | `false` / `true` | Session behavior |
 
-**`open(options)`**
+## Mobile test checklist (Brave / Chrome, HTTPS)
 
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `onScan` | `(text, format) => void` | required | Called when a code is decoded (`format`: `qrcode`, `datamatrix`, …) |
-| `onError` | `(err: Error) => void` | — | Camera / permission / WASM errors |
-| `onClose` | `(lastText?: string) => void` | — | When overlay is closed |
-| `onCameraReady` | `(info) => void` | — | Actual stream size after open (`width`, `height`, `frameRate`, `deviceLabel`, `imageCapture`) |
-| `formats` | `string[]` | `["qrcode","datamatrix"]` | Symbologies to search for |
-| `decodeResolution` | `number` | `2048` | Decode size (`1024`–`2048`; up to `2560` with `prefer4K`) |
-| `roiFraction` | `number` | `0.85` | Center crop fraction of the frame (viewfinder) |
-| `prefer4K` | `boolean` | `false` | Prefer 4K camera stream (demo uses `true`) |
-| `highResStills` | `boolean` | `true` if supported | `ImageCapture` JPEG decode on an interval |
-| `stillIntervalMs` | `number` | `500` | Minimum ms between high-res still captures |
-| `adaptiveDecode` | `boolean` | `false` | If `true`, drop to 1536px decode after slow frames |
-| `useWorker` | `boolean` | `true` | Run WASM decode in a Web Worker |
-| `continuous` | `boolean` | `false` | Keep scanning after each result |
-| `closeOnScan` | `boolean` | `true` | Close overlay after first scan (when `continuous` is false) |
+| Test | Expected |
+|------|----------|
+| Open demo | Full-screen video, large finder (not a small boxed preview) |
+| `onCameraReady` | `width` ≥ 1280 when the device allows; `photoWidthMax` &gt; preview width when `ImageCapture` works |
+| Small QR ~40cm | Still capture within ~1s; decode succeeds |
+| After scan | Result sheet with format + text (if `showResultSheet`) |
+| vs Scanbot web demo | Similar sharp preview; tiny/damaged codes may differ (rxing vs proprietary engine) |
 
-### React (example)
-
-```jsx
-import { useCallback } from "react";
-import { RustbarScanner } from "./rustbar.js";
-
-function ScanButton({ onResult }) {
-  const scan = useCallback(async () => {
-    await RustbarScanner.init();
-    await RustbarScanner.open({
-      onScan: (text, format) => onResult({ text, format }),
-      formats: ["qrcode", "datamatrix"],
-      prefer4K: true,
-      closeOnScan: true,
-    });
-  }, [onResult]);
-
-  return <button onClick={scan}>Scan</button>;
-}
-```
-
-> Call `open()` from a **user click** on first visit so mobile browsers allow the camera.
-
-## Manual test checklist
-
-| Target | Check |
-|--------|--------|
-| Desktop Chrome | `onCameraReady` width ≥ 1280; QR at ~30 cm and ~1 m |
-| Android Chrome | `imageCapture: true` in `onCameraReady`; still path helps small codes |
-| iOS Safari | Camera permission + scan; torch if available |
-| No ImageCapture | Video-only path; no errors |
-
-## Project layout
+## Architecture
 
 ```
-Rustbar/
-├── scanner/                 # Rust → WASM (rxing decoder)
-│   └── src/lib.rs
-├── www/
-│   ├── js/rustbar.js
-│   ├── js/camera.js
-│   ├── js/capture.js
-│   └── pkg/
-├── .github/workflows/pages.yml
-└── build.sh
+www/js/rustbar.js      # API + scan state machine
+www/js/camera.js       # getUserMedia, focus hints, torch
+www/js/capture.js      # ImageCapture takePhoto / grabFrame
+crates/rustbar-core/   # rxing decode pipeline
+scanner/               # wasm-bindgen → www/pkg
 ```
 
 ## WASM exports
 
 | Export | Description |
 |--------|-------------|
-| `decodeVideoFrame(rgba, frameW, frameH, roi, targetSize, formatsHint)` | **Main API** — full pipeline in Rust |
-| `decodeFrameRgba(data, w, h, formatsHint)` | Square RGBA already cropped/resized |
-| `decodeImageBytes(bytes, formatsHint)` | Decode from image file bytes (e.g. ImageCapture JPEG) |
-| `decodeQrRgba` | Legacy alias (text only) |
-
-## Adding more formats later
-
-Enable the matching feature in [`scanner/Cargo.toml`](scanner/Cargo.toml) (e.g. `aztec`, `pdf417`) and pass the name in `formats: ["qrcode", "datamatrix", "aztec"]`.
+| `decodeVideoFrame` | Main live path — ROI crop + decode |
+| `decodeImageBytes` | JPEG/PNG still (capped at 4096px, +270° rotation) |
+| `decodeFrameRgba` | Pre-sized RGBA square |
 
 ## License
 

@@ -1,0 +1,23 @@
+name: Rust
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build workspace
+        run: |
+          cargo build --release -p rustbar-core
+          cargo build --release -p rustbar-scanner --target wasm32-unknown-unknown 2>/dev/null || true
+      - name: wasm-pack web build
+        run: |
+          curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh -s -- -y
+          rustup target add wasm32-unknown-unknown
+          ./build.sh

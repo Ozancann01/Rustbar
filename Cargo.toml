@@ -1,5 +1,5 @@
 [workspace]
-members = ["scanner"]
+members = ["scanner", "crates/rustbar-core"]
 resolver = "2"
 
 [profile.release]

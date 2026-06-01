@@ -5,31 +5,42 @@
 import init, { decodeVideoFrame, decodeImageBytes } from "../pkg/rustbar_scanner.js";
 import {
   applyCameraEnhancements,
+  applyCenterFocusHint,
   getStreamSettings,
   maybeRepickCamera,
   openCameraStream,
   pickBestCameraDevice,
-  syncNativeVideoSize,
   toggleTorch,
   upgradeStreamIfLow,
 } from "./camera.js";
 import {
   captureHighResStill,
   createImageCapture,
+  getPhotoMaxWidth,
   isImageCaptureSupported,
 } from "./capture.js";
-import { createScannerOverlay, setOverlayStatus } from "./scanner-ui.js";
+import { ScanPhase, ScanStateMachine } from "./scan-state.js";
+import {
+  createScannerOverlay,
+  hideResultSheet,
+  setOverlayStatus,
+  showResultSheet,
+} from "./scanner-ui.js";
 
 const DEFAULT_DECODE = 2048;
 const FAST_DECODE = 1536;
 const MAX_DECODE_4K = 2560;
 const DEFAULT_ROI = 0.85;
+const EXPANDED_ROI = 0.92;
 const CONFIRM_FRAMES = 1;
 const SLOW_MS = 50;
 const DEFAULT_FORMATS = ["qrcode", "datamatrix"];
-const DEFAULT_STILL_INTERVAL_MS = 500;
-const MISS_STILL_THRESHOLD = 3;
-const NATIVE_DETECT_MAX = 800;
+const DESKTOP_STILL_INTERVAL_MS = 500;
+const MOBILE_STILL_INTERVAL_MS = 350;
+const MOBILE_FIRST_STILL_MS = 800;
+const PREVIEW_INTERVAL_MS = 72;
+const NATIVE_DETECT_CROP_MAX = 1200;
+const MOBILE_PREVIEW_DEFER_MS = 800;
 
 let wasmInit = null;
 let worker = null;
@@ -37,10 +48,16 @@ let activeSession = null;
 let nativeDetector = null;
 let nativeDetectorFormats = null;
 
-const frameCanvas = document.createElement("canvas");
-const frameCtx = frameCanvas.getContext("2d", { willReadFrequently: true });
-const detectCanvas = document.createElement("canvas");
-const detectCtx = detectCanvas.getContext("2d", { willReadFrequently: true });
+const decodeCanvas = document.createElement("canvas");
+const decodeCtx = decodeCanvas.getContext("2d", { willReadFrequently: true });
+const captureCanvas = document.createElement("canvas");
+const captureCtx = captureCanvas.getContext("2d", { willReadFrequently: true });
+const thumbCanvas = document.createElement("canvas");
+const thumbCtx = thumbCanvas.getContext("2d");
+
+function isMobileUa() {
+  return /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
+}
 
 async function ensureWasm() {
   if (!wasmInit) wasmInit = init();
@@ -117,6 +134,12 @@ function formatsHint(formats) {
   return formats.map((f) => f.trim().toLowerCase()).join(",");
 }
 
+function recognitionToDecodeSize(recognitionResolution, prefer4K) {
+  const n = Number(recognitionResolution);
+  if (n === 1536 || n === 2048 || n === 2560) return n;
+  return clampDecode(n || DEFAULT_DECODE, prefer4K);
+}
+
 function clampDecode(n, prefer4K) {
   const max = prefer4K ? MAX_DECODE_4K : 2048;
   const v = Number(n) || DEFAULT_DECODE;
@@ -132,10 +155,7 @@ async function ensureNativeDetector(formats) {
   const supported = (await BarcodeDetector.getSupportedFormats?.()) ?? [];
   if (!supported.includes("qr_code")) return null;
 
-  if (
-    nativeDetector &&
-    nativeDetectorFormats === wanted.join(",")
-  ) {
+  if (nativeDetector && nativeDetectorFormats === wanted.join(",")) {
     return nativeDetector;
   }
 
@@ -144,7 +164,11 @@ async function ensureNativeDetector(formats) {
   return nativeDetector;
 }
 
-async function tryNativeDetect(video, formats) {
+/**
+ * BarcodeDetector on center finder crop (~1200px wide).
+ * @returns {Promise<{ text: string, format: string } | { nativeMiss: true } | null>}
+ */
+async function tryNativeDetect(video, formats, roiFraction) {
   const detector = await ensureNativeDetector(formats);
   if (!detector) return null;
 
@@ -152,32 +176,68 @@ async function tryNativeDetect(video, formats) {
   const h = video.videoHeight;
   if (!w || !h) return null;
 
-  const scale = Math.min(1, NATIVE_DETECT_MAX / Math.max(w, h));
-  const dw = Math.max(1, Math.round(w * scale));
-  const dh = Math.max(1, Math.round(h * scale));
+  const roi = Math.min(0.95, Math.max(0.5, roiFraction));
+  const side = Math.min(w, h) * roi;
+  const sx = (w - side) / 2;
+  const sy = (h - side) / 2;
+  const scale = Math.min(1, NATIVE_DETECT_CROP_MAX / side);
+  const dw = Math.max(1, Math.round(side * scale));
+  const dh = Math.max(1, Math.round(side * scale));
   detectCanvas.width = dw;
   detectCanvas.height = dh;
-  detectCtx.drawImage(video, 0, 0, dw, dh);
+  decodeCtx.drawImage(video, sx, sy, side, side, 0, 0, dw, dh);
 
   try {
     const codes = await detector.detect(detectCanvas);
     const hit = codes?.[0];
-    if (!hit?.rawValue) return null;
+    if (!hit?.rawValue) return { nativeMiss: true };
     return { text: hit.rawValue, format: "qrcode" };
   } catch {
     return null;
   }
 }
 
-/** Copy full camera frame to RGBA buffer (only JS step before Rust). */
-function captureFrameRgba(video) {
+/** Copy full camera frame to RGBA (off-DOM decode canvas). */
+async function captureFrameRgba(video) {
   const w = video.videoWidth;
   const h = video.videoHeight;
   if (!w || !h) return null;
-  frameCanvas.width = w;
-  frameCanvas.height = h;
-  frameCtx.drawImage(video, 0, 0, w, h);
-  return { data: frameCtx.getImageData(0, 0, w, h).data, width: w, height: h };
+
+  captureCanvas.width = w;
+  captureCanvas.height = h;
+
+  if (typeof createImageBitmap === "function") {
+    try {
+      const bitmap = await createImageBitmap(video);
+      captureCtx.drawImage(bitmap, 0, 0, w, h);
+      bitmap.close?.();
+    } catch {
+      captureCtx.drawImage(video, 0, 0, w, h);
+    }
+  } else {
+    captureCtx.drawImage(video, 0, 0, w, h);
+  }
+
+  return {
+    data: captureCtx.getImageData(0, 0, w, h).data,
+    width: w,
+    height: h,
+  };
+}
+
+function makeFinderThumb(video, roiFraction) {
+  const w = video.videoWidth;
+  const h = video.videoHeight;
+  if (!w || !h) return undefined;
+  const roi = Math.min(0.95, Math.max(0.5, roiFraction));
+  const side = Math.min(w, h) * roi;
+  const sx = (w - side) / 2;
+  const sy = (h - side) / 2;
+  const size = 96;
+  thumbCanvas.width = size;
+  thumbCanvas.height = size;
+  thumbCtx.drawImage(video, sx, sy, side, side, 0, 0, size, size);
+  return thumbCanvas.toDataURL("image/jpeg", 0.75);
 }
 
 class Session {
@@ -185,30 +245,52 @@ class Session {
     this.opts = opts;
     this.formats = opts.formats?.length ? opts.formats : DEFAULT_FORMATS;
     this.hint = formatsHint(this.formats);
-    this.prefer4K = opts.prefer4K ?? false;
-    this.decodeRes = clampDecode(opts.decodeResolution, this.prefer4K);
-    this.roi = Math.min(0.95, Math.max(0.5, opts.roiFraction ?? DEFAULT_ROI));
+    this.isMobile = opts.mobile ?? isMobileUa();
+    this.prefer4K = opts.prefer4K !== false;
+    this.use4KStream = opts.use4KStream ?? this.prefer4K;
+    const rec =
+      opts.recognitionResolution ?? opts.decodeResolution ?? DEFAULT_DECODE;
+    this.decodeRes = recognitionToDecodeSize(rec, this.prefer4K);
+    this.baseRoi = Math.min(0.95, Math.max(0.5, opts.roiFraction ?? DEFAULT_ROI));
+    this.roi = this.baseRoi;
+    this.roiExpanded = false;
     this.useWorker = opts.useWorker !== false;
     this.adaptiveDecode = opts.adaptiveDecode === true;
     this.highResStills =
       opts.highResStills !== false && isImageCaptureSupported();
-    this.stillIntervalMs = opts.stillIntervalMs ?? DEFAULT_STILL_INTERVAL_MS;
+    const defaultStillMs = this.isMobile
+      ? MOBILE_STILL_INTERVAL_MS
+      : DESKTOP_STILL_INTERVAL_MS;
+    this.stillIntervalMs = opts.stillIntervalMs ?? defaultStillMs;
+    const earlyStill =
+      this.isMobile && this.highResStills ? MOBILE_FIRST_STILL_MS : 0;
+    this.scanState = new ScanStateMachine(3, this.stillIntervalMs, {
+      mobileEarlyStillMs: earlyStill,
+    });
+    this.showResultSheet =
+      opts.showResultSheet ?? (this.isMobile && opts.continuous !== true);
     this.closed = false;
     this.stream = null;
     this.imageCapture = null;
     this.scanning = false;
     this.videoDecodeBusy = false;
     this.stillDecodeBusy = false;
+    this.stillPipelineBusy = false;
     this.fastNext = false;
     this.torchOn = false;
     this.repicked = false;
     this.raf = null;
     this.hit = null;
     this.hitN = 0;
-    this.missCount = 0;
-    this.lastStillAt = 0;
     this.ui = null;
     this.last = "";
+    this.lastPreviewAt = 0;
+    this.nativeMissStillDone = false;
+    this.mobilePreviewDefer =
+      this.isMobile && this.highResStills && opts.mobileStillFirst !== false;
+    this.previewDecodeEnabled = !this.mobilePreviewDefer;
+    this.sessionStartedAt = 0;
+    this.pendingClose = false;
   }
 
   close() {
@@ -229,15 +311,60 @@ class Session {
     return this.decodeRes;
   }
 
+  _expandRoiOnMiss() {
+    if (!this.roiExpanded && this.scanState.missCount >= 2) {
+      this.roi = Math.max(this.roi, EXPANDED_ROI);
+      this.roiExpanded = true;
+    }
+  }
+
+  _finishScan(result) {
+    this.last = result.text;
+    this.opts.onScan(result.text, result.format);
+    if (navigator.vibrate) navigator.vibrate(40);
+
+    const shouldClose = this.opts.closeOnScan !== false && !this.opts.continuous;
+
+    if (this.showResultSheet && this.ui) {
+      const thumb = makeFinderThumb(this.ui.video, this.roi);
+      showResultSheet(this.ui, {
+        text: result.text,
+        format: result.format,
+        thumbUrl: thumb,
+      });
+      this.scanning = false;
+      this.pendingClose = shouldClose;
+      return;
+    }
+
+    if (!this.opts.continuous) {
+      this.scanning = false;
+      if (shouldClose) this.close();
+    } else {
+      this.scanState.reset();
+      this.roi = this.baseRoi;
+      this.roiExpanded = false;
+      this.nativeMissStillDone = false;
+      if (this.mobilePreviewDefer) {
+        this.previewDecodeEnabled = false;
+        this.sessionStartedAt = performance.now();
+        setTimeout(() => {
+          this.previewDecodeEnabled = true;
+        }, MOBILE_PREVIEW_DEFER_MS);
+      }
+    }
+  }
+
   _handleResult(result) {
     if (!result) {
       this.hit = null;
       this.hitN = 0;
-      this.missCount++;
+      this.scanState.onPreviewMiss();
+      this._expandRoiOnMiss();
       return false;
     }
 
-    this.missCount = 0;
+    this.scanState.onPreviewHit();
     const key = `${result.format}:${result.text}`;
     if (this.hit?.key === key) this.hitN++;
     else {
@@ -246,14 +373,7 @@ class Session {
     }
     if (this.hitN < CONFIRM_FRAMES) return false;
 
-    this.last = result.text;
-    this.opts.onScan(result.text, result.format);
-    if (navigator.vibrate) navigator.vibrate(40);
-
-    if (!this.opts.continuous) {
-      this.scanning = false;
-      if (this.opts.closeOnScan !== false) this.close();
-    }
+    this._finishScan(result);
     return true;
   }
 
@@ -292,12 +412,27 @@ class Session {
     return r ? { text: r.text, format: r.format } : null;
   }
 
+  _onNativeMiss() {
+    if (!this.isMobile || this.nativeMissStillDone || !this.highResStills) {
+      return;
+    }
+    this.nativeMissStillDone = true;
+    this.scanState.forceStill();
+  }
+
   async _processVideoFrame(frame) {
+    if (this.scanState.phase === ScanPhase.DecodeStill) return;
+
     const target = this._decodeSize();
     const t0 = performance.now();
     try {
-      const native = await tryNativeDetect(this.ui.video, this.formats);
-      if (native && this._handleResult(native)) return;
+      const native = await tryNativeDetect(
+        this.ui.video,
+        this.formats,
+        this.roi,
+      );
+      if (native?.text && this._handleResult(native)) return;
+      if (native?.nativeMiss) this._onNativeMiss();
 
       const result = await this._decodeRust(frame, target);
       if (this.adaptiveDecode && performance.now() - t0 > SLOW_MS) {
@@ -309,37 +444,85 @@ class Session {
     }
   }
 
-  async _maybeCaptureStill() {
-    if (!this.highResStills || !this.imageCapture || this.stillDecodeBusy) {
+  async _runStillPipeline() {
+    if (
+      !this.highResStills ||
+      !this.imageCapture ||
+      this.stillDecodeBusy ||
+      this.stillPipelineBusy ||
+      !this.scanState.canCaptureStill()
+    ) {
       return;
     }
 
-    const now = performance.now();
-    const dueByTime = now - this.lastStillAt >= this.stillIntervalMs;
-    const dueByMiss = this.missCount >= MISS_STILL_THRESHOLD;
-    if (!dueByTime && !dueByMiss) return;
-
-    this.lastStillAt = now;
-    this.stillDecodeBusy = true;
+    this.stillPipelineBusy = true;
     try {
-      const blob = await captureHighResStill(this.imageCapture);
-      if (!blob || this.closed || !this.scanning) return;
+      await applyCenterFocusHint(this.stream);
+      this.scanState.onRoiLockSettled();
+
+      this.stillDecodeBusy = true;
+      this.scanState.onStillCaptureStarted();
+
+      const blob = await captureHighResStill(this.imageCapture, {
+        torchOn: this.torchOn,
+      });
+      if (!blob || this.closed || !this.scanning) {
+        this.scanState.onStillDecodeDone(false);
+        return;
+      }
+
       const result = await this._decodeStillBlob(blob);
-      this._handleResult(result);
+      const found = this._handleResult(result);
+      this.scanState.onStillDecodeDone(found);
+      if (found) this.scanState.phase = ScanPhase.Done;
+      if (this.mobilePreviewDefer && !found) {
+        this.previewDecodeEnabled = true;
+      }
     } catch {
-      /* still capture failed */
+      this.scanState.onStillDecodeDone(false);
+      if (this.mobilePreviewDefer) this.previewDecodeEnabled = true;
     } finally {
       this.stillDecodeBusy = false;
+      this.stillPipelineBusy = false;
     }
   }
 
-  _tick() {
+  async _tick() {
     const video = this.ui?.video;
     if (!video || video.readyState < 2) return;
 
-    if (!this.videoDecodeBusy) {
-      const frame = captureFrameRgba(video);
+    const now = performance.now();
+    if (
+      this.mobilePreviewDefer &&
+      !this.previewDecodeEnabled &&
+      now - this.sessionStartedAt >= MOBILE_PREVIEW_DEFER_MS
+    ) {
+      this.previewDecodeEnabled = true;
+    }
+
+    this.scanState.requestStillByTimer();
+
+    if (
+      this.scanState.phase === ScanPhase.RoiLock &&
+      !this.stillPipelineBusy
+    ) {
+      void this._runStillPipeline();
+    }
+
+    if (this.stillPipelineBusy) return;
+
+    if (!this.previewDecodeEnabled) return;
+
+    if (now - this.lastPreviewAt < PREVIEW_INTERVAL_MS) return;
+
+    if (
+      !this.videoDecodeBusy &&
+      this.scanState.phase !== ScanPhase.DecodeStill &&
+      this.scanState.phase !== ScanPhase.CaptureStill
+    ) {
+      const frame = await captureFrameRgba(video);
       if (frame) {
+        this.lastPreviewAt = now;
         this.videoDecodeBusy = true;
         const snapshot = {
           data: new Uint8ClampedArray(frame.data),
@@ -351,24 +534,28 @@ class Session {
         });
       }
     }
-
-    void this._maybeCaptureStill();
   }
 
   _loop() {
     if (!this.scanning || this.closed) return;
-    this._tick();
+    void this._tick();
     this.raf = requestAnimationFrame(() => this._loop());
   }
 
-  _notifyCameraReady() {
+  async _notifyCameraReady() {
     const info = getStreamSettings(this.stream);
+    const photoWidthMax = this.imageCapture
+      ? await getPhotoMaxWidth(this.imageCapture)
+      : 0;
     this.opts.onCameraReady?.({
       width: info.width,
       height: info.height,
       frameRate: info.frameRate,
       deviceLabel: info.deviceLabel,
       imageCapture: this.highResStills,
+      photoWidthMax,
+      use4KStream: this.use4KStream,
+      recognitionResolution: this.decodeRes,
     });
   }
 
@@ -388,17 +575,18 @@ class Session {
       else video.onloadedmetadata = r;
     });
     await video.play().catch(() => {});
-    syncNativeVideoSize(video);
     await applyCameraEnhancements(this.stream, this.ui.torchBtn);
 
     if (!this.repicked) {
       this.repicked = true;
-      this.stream = await maybeRepickCamera(this.stream, this.prefer4K, video);
-      syncNativeVideoSize(video);
+      this.stream = await maybeRepickCamera(this.stream, this.use4KStream, video);
     }
 
-    this.stream = await upgradeStreamIfLow(this.stream, video);
-    syncNativeVideoSize(video);
+    if (this.use4KStream) {
+      this.stream = await upgradeStreamIfLow(this.stream, video, 1920);
+    } else {
+      this.stream = await upgradeStreamIfLow(this.stream, video, 1280);
+    }
 
     this.imageCapture = this.highResStills
       ? createImageCapture(this.stream)
@@ -406,11 +594,48 @@ class Session {
     if (!this.imageCapture) this.highResStills = false;
 
     const s = getStreamSettings(this.stream);
-    if (this.prefer4K && s.width >= 1920) {
-      this.decodeRes = clampDecode(MAX_DECODE_4K, true);
+    if (this.use4KStream && s.width >= 1920) {
+      this.decodeRes = clampDecode(
+        Math.max(this.decodeRes, MAX_DECODE_4K),
+        true,
+      );
     }
 
     this._notifyCameraReady();
+  }
+
+  _wireResultSheet() {
+    this.ui.resultCloseBtn.onclick = () => {
+      hideResultSheet(this.ui);
+      if (this.pendingClose) {
+        this.close();
+      } else if (this.opts.continuous) {
+        this.scanning = true;
+        this.scanState.reset();
+        this.hit = null;
+        this.hitN = 0;
+        this.roi = this.baseRoi;
+        this.roiExpanded = false;
+        this.nativeMissStillDone = false;
+        setOverlayStatus(
+          this.ui.status,
+          "Point at a QR or Data Matrix code",
+          "scanning",
+        );
+        this._loop();
+      }
+    };
+    this.ui.resultCopyBtn.onclick = async () => {
+      try {
+        await navigator.clipboard.writeText(this.last);
+        this.ui.resultCopyBtn.textContent = "Copied";
+        setTimeout(() => {
+          this.ui.resultCopyBtn.textContent = "Copy";
+        }, 1500);
+      } catch {
+        /* clipboard denied */
+      }
+    };
   }
 
   async open() {
@@ -418,14 +643,14 @@ class Session {
     activeSession = this;
 
     this.ui = createScannerOverlay();
+    this._wireResultSheet();
     this.ui.closeBtn.onclick = () => this.close();
     this.ui.torchBtn.onclick = async () => {
       this.torchOn = await toggleTorch(this.stream, this.torchOn);
       this.ui.torchBtn.classList.toggle(
-        "rustbar-overlay__torch--on",
+        "rustbar-overlay__icon-btn--on",
         this.torchOn,
       );
-      this.ui.torchBtn.textContent = this.torchOn ? "Flash off" : "Flash";
     };
     this.ui.allowBtn.onclick = () => {
       this.ui.allowBtn.hidden = true;
@@ -440,14 +665,17 @@ class Session {
     setOverlayStatus(this.ui.status, "Requesting camera…");
     this.ui.allowBtn.hidden = true;
     await this._runCamera();
+    this.sessionStartedAt = performance.now();
     this._loop();
   }
 
   async _runCamera() {
     await this._startCamera();
     this.scanning = true;
-    this.lastStillAt = performance.now();
-    setOverlayStatus(this.ui.status, "Point at a QR or Data Matrix code", "scanning");
+    this.scanState.reset();
+    this.sessionStartedAt = performance.now();
+    setOverlayStatus(this.ui.status, "", "");
+    this.ui.finderHint.hidden = false;
   }
 
   _cameraError(e) {

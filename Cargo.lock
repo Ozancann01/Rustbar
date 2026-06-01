@@ -195,9 +195,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c673075a2e0e5f4a1dde27ce9dee1ea4558c7ffe648f576438a20ca1d2acc4b0"
 dependencies = [
  "iana-time-zone",
- "js-sys",
  "num-traits",
- "wasm-bindgen",
  "windows-link",
 ]
 
@@ -1082,11 +1080,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47b34b781b31e5d73e9fbc8689c70551fd1ade9a19e3e28cfec8580a79290cc4"
 
 [[package]]
-name = "rustbar-scanner"
+name = "rustbar-core"
 version = "0.1.0"
 dependencies = [
  "image",
  "rxing",
+]
+
+[[package]]
+name = "rustbar-scanner"
+version = "0.1.0"
+dependencies = [
+ "rustbar-core",
  "wasm-bindgen",
 ]
 
