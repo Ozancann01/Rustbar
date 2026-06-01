@@ -6,20 +6,25 @@ import { RustbarScanner } from "./rustbar.js";
 
 const scanBtn = document.getElementById("scan-btn");
 const resultEl = document.getElementById("demo-result");
-
-let session = null;
+const formatEl = document.getElementById("demo-format");
 
 scanBtn.addEventListener("click", async () => {
   resultEl.hidden = true;
+  if (formatEl) formatEl.hidden = true;
 
-  session = await RustbarScanner.open({
-    onScan(text) {
+  await RustbarScanner.open({
+    onScan(text, format) {
       resultEl.textContent = text;
       resultEl.hidden = false;
+      if (formatEl) {
+        formatEl.textContent = `Format: ${format}`;
+        formatEl.hidden = false;
+      }
     },
     onError(err) {
       console.error("Rustbar:", err);
     },
+    formats: ["qrcode", "datamatrix"],
     continuous: false,
     closeOnScan: true,
   });

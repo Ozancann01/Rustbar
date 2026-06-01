@@ -35,7 +35,7 @@ export function createScannerOverlay() {
   root.setAttribute("aria-label", "QR code scanner");
   root.innerHTML = `
     <header class="rustbar-overlay__header">
-      <h2 class="rustbar-overlay__title">Scan QR code</h2>
+      <h2 class="rustbar-overlay__title">Scan code</h2>
       <button type="button" class="rustbar-overlay__close" data-rustbar-close>Close</button>
     </header>
     <div class="rustbar-overlay__body">

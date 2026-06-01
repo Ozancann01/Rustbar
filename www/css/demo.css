@@ -62,8 +62,14 @@ body {
   max-width: 280px;
 }
 
+.demo-format {
+  margin-top: 16px;
+  font-size: 0.85rem;
+  color: #34d399;
+}
+
 .demo-result {
-  margin-top: 20px;
+  margin-top: 8px;
   padding: 14px;
   background: #14141c;
   border-radius: 12px;

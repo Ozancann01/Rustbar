@@ -1,13 +1,14 @@
-# Rustbar — Live QR Scanner Library (Rust + WASM)
+# Rustbar — Live Barcode Scanner Library (Rust + WASM)
 
-Embeddable browser library: call **`RustbarScanner.open()`** and it opens the camera, scans QR codes live using Rust/WebAssembly (`rqrr`), and returns the decoded text to your app.
+Embeddable browser library: call **`RustbarScanner.open()`** and it opens the camera, scans **QR codes** and **Data Matrix** live using Rust/WebAssembly ([rxing](https://github.com/rxing-core/rxing) / ZXing), and returns the decoded text to your app.
 
 ## Features
 
-- **Library API** — `init()`, `open()`, `close()` with `onScan` / `onError` callbacks
-- **Auto camera** — rear camera on mobile; fallback “Allow camera” button if permission is blocked
-- **High-quality decode** — full camera resolution frames, ~8 scans/sec
-- **Mobile-friendly** — full-screen overlay, safe areas, `playsinline` for iOS
+- **Library API** — `init()`, `open()`, `close()` with `onScan(text, format)` / `onError` callbacks
+- **Formats** — QR Code and Data Matrix (more symbologies later via `formats` option)
+- **Strong decode** — rxing with `TryHarder` + inverted detection; center ROI crop at 1024px
+- **Live scan** — `requestAnimationFrame` loop with 2-frame confirmation (stable auto-detect)
+- **Mobile** — rear camera, continuous focus/exposure when supported, `playsinline` for iOS
 
 ## Prerequisites
 
@@ -38,10 +39,8 @@ The repo includes [`.github/workflows/pages.yml`](.github/workflows/pages.yml). 
 
 1. Push this repo to GitHub.
 2. **Settings → Pages → Build and deployment** → Source: **GitHub Actions**.
-3. After the workflow succeeds, open your site (e.g. `https://<user>.github.io/<repo>/`).
+3. After the workflow succeeds, open your site (e.g. `https://ozancann01.github.io/Rustbar/`).
 4. On your phone, open that HTTPS URL and tap **Scan QR code**.
-
-GitHub Pages serves over HTTPS, so the camera works on mobile without extra setup.
 
 ## Library usage
 
@@ -63,13 +62,11 @@ Copy these paths into your project (or serve them statically):
 
   document.getElementById("scan").onclick = async () => {
     const session = await RustbarScanner.open({
-      onScan(text) {
-        console.log("QR:", text);
+      onScan(text, format) {
+        console.log(format, text);
         session.close();
       },
-      onError(err) {
-        console.error(err);
-      },
+      formats: ["qrcode", "datamatrix"],
       continuous: false,
       closeOnScan: true,
     });
@@ -88,9 +85,10 @@ Copy these paths into your project (or serve them statically):
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `onScan` | `(text: string) => void` | required | Called when a QR code is decoded |
+| `onScan` | `(text, format) => void` | required | Called when a code is decoded (`format`: `qrcode`, `datamatrix`, …) |
 | `onError` | `(err: Error) => void` | — | Camera / permission / WASM errors |
 | `onClose` | `(lastText?: string) => void` | — | When overlay is closed |
+| `formats` | `string[]` | `["qrcode","datamatrix"]` | Symbologies to search for |
 | `continuous` | `boolean` | `false` | Keep scanning after each result |
 | `closeOnScan` | `boolean` | `true` | Close overlay after first scan (when `continuous` is false) |
 
@@ -104,12 +102,13 @@ function ScanButton({ onResult }) {
   const scan = useCallback(async () => {
     await RustbarScanner.init();
     await RustbarScanner.open({
-      onScan: onResult,
+      onScan: (text, format) => onResult({ text, format }),
+      formats: ["qrcode", "datamatrix"],
       closeOnScan: true,
     });
   }, [onResult]);
 
-  return <button onClick={scan}>Scan QR</button>;
+  return <button onClick={scan}>Scan</button>;
 }
 ```
 
@@ -119,15 +118,11 @@ function ScanButton({ onResult }) {
 
 ```
 Rustbar/
-├── scanner/                 # Rust → WASM (rqrr decoder)
+├── scanner/                 # Rust → WASM (rxing decoder)
 │   └── src/lib.rs
-├── www/                     # Static site (GitHub Pages root)
-│   ├── js/
-│   │   ├── rustbar.js       # Public API
-│   │   ├── scanner-ui.js
-│   │   └── demo.js
-│   ├── css/
-│   └── pkg/                 # wasm-pack output (built in CI)
+├── www/
+│   ├── js/rustbar.js
+│   └── pkg/
 ├── .github/workflows/pages.yml
 └── build.sh
 ```
@@ -136,8 +131,13 @@ Rustbar/
 
 | Export | Description |
 |--------|-------------|
-| `decodeQrRgba(data, width, height)` | RGBA buffer from canvas |
-| `decodeQrImageBytes(bytes)` | PNG/JPEG/WebP bytes |
+| `decodeFrameRgba(data, w, h, formatsHint)` | Returns `{ text, format }` or null |
+| `decodeImageBytes(bytes, formatsHint)` | Decode from image file bytes |
+| `decodeQrRgba` | Legacy alias (text only) |
+
+## Adding more formats later
+
+Enable the matching feature in [`scanner/Cargo.toml`](scanner/Cargo.toml) (e.g. `aztec`, `pdf417`) and pass the name in `formats: ["qrcode", "datamatrix", "aztec"]`.
 
 ## License
 

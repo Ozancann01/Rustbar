@@ -1,20 +1,14 @@
 /**
- * Rustbar — embeddable live QR scanner (Rust + WebAssembly).
- *
- * @example
- * import { RustbarScanner } from "./js/rustbar.js";
- *
- * await RustbarScanner.init();
- * const session = await RustbarScanner.open({
- *   onScan(text) { console.log(text); session.close(); },
- * });
+ * Rustbar — embeddable live barcode scanner (Rust + WebAssembly / rxing).
  */
 
-import init, { decodeQrRgba } from "../pkg/rustbar_scanner.js";
+import init, { decodeFrameRgba } from "../pkg/rustbar_scanner.js";
 import { createScannerOverlay, setOverlayStatus } from "./scanner-ui.js";
 
-const SCAN_FPS = 8;
-const SCAN_INTERVAL_MS = 1000 / SCAN_FPS;
+const DECODE_SIZE = 1024;
+const ROI_FRACTION = 0.72;
+const CONFIRM_FRAMES = 2;
+const DEFAULT_FORMATS = ["qrcode", "datamatrix"];
 
 let wasmInitPromise = null;
 let activeSession = null;
@@ -27,6 +21,10 @@ async function ensureWasm() {
     wasmInitPromise = init();
   }
   await wasmInitPromise;
+}
+
+function formatsToHint(formats) {
+  return formats.map((f) => f.trim().toLowerCase()).join(",");
 }
 
 async function pickCameraDevice() {
@@ -44,26 +42,26 @@ function vibrateOnScan() {
 
 /**
  * @typedef {Object} OpenOptions
- * @property {(text: string) => void} onScan - Called when a QR code is decoded.
- * @property {(error: Error) => void} [onError] - Camera or permission errors.
- * @property {(text: string) => void} [onClose] - Called when the session closes.
- * @property {boolean} [continuous=false] - If true, keep scanning after each result.
- * @property {boolean} [closeOnScan=true] - If true, close overlay after first scan (when continuous is false).
- */
-
-/**
- * @typedef {Object} ScannerSession
- * @property {() => void} close - Stop camera and remove overlay.
+ * @property {(text: string, format: string) => void} onScan
+ * @property {(error: Error) => void} [onError]
+ * @property {(lastText?: string) => void} [onClose]
+ * @property {string[]} [formats] - e.g. ["qrcode", "datamatrix"]
+ * @property {boolean} [continuous=false]
+ * @property {boolean} [closeOnScan=true]
  */
 
 class ScannerSessionImpl {
-  /** @param {OpenOptions} options */
   constructor(options) {
     this.options = options;
+    this.formats = options.formats?.length ? options.formats : DEFAULT_FORMATS;
+    this.formatsHint = formatsToHint(this.formats);
     this.closed = false;
     this.stream = null;
-    this.scanTimer = null;
     this.scanning = false;
+    this.decodeInFlight = false;
+    this.rafId = null;
+    this.pendingHit = null;
+    this.confirmCount = 0;
     this.lastResult = "";
     this.ui = null;
     this._onVisibility = null;
@@ -99,56 +97,131 @@ class ScannerSessionImpl {
   }
 
   _stopScanLoop() {
-    if (this.scanTimer !== null) {
-      clearInterval(this.scanTimer);
-      this.scanTimer = null;
+    if (this.rafId !== null) {
+      cancelAnimationFrame(this.rafId);
+      this.rafId = null;
     }
     this.scanning = false;
+    this.decodeInFlight = false;
+    this.pendingHit = null;
+    this.confirmCount = 0;
   }
 
   _startScanLoop() {
     this._stopScanLoop();
     this.scanning = true;
-    const video = this.ui.video;
-    this.scanTimer = setInterval(() => {
-      if (!this.scanning || this.closed || video.readyState < 2) return;
-      this._tryDecodeFrame();
-    }, SCAN_INTERVAL_MS);
+    const tick = () => {
+      if (!this.scanning || this.closed) return;
+      if (!this.decodeInFlight) {
+        this._tryDecodeFrame();
+      }
+      this.rafId = requestAnimationFrame(tick);
+    };
+    this.rafId = requestAnimationFrame(tick);
+  }
+
+  /** Crop center square (viewfinder) and scale for decode. */
+  _captureRoiImageData(video) {
+    const vw = video.videoWidth;
+    const vh = video.videoHeight;
+    if (!vw || !vh) return null;
+
+    const side = Math.floor(Math.min(vw, vh) * ROI_FRACTION);
+    const sx = Math.floor((vw - side) / 2);
+    const sy = Math.floor((vh - side) / 2);
+
+    captureCanvas.width = DECODE_SIZE;
+    captureCanvas.height = DECODE_SIZE;
+    captureCtx.drawImage(video, sx, sy, side, side, 0, 0, DECODE_SIZE, DECODE_SIZE);
+    return captureCtx.getImageData(0, 0, DECODE_SIZE, DECODE_SIZE);
   }
 
   _tryDecodeFrame() {
-    const video = this.ui.video;
-    const w = video.videoWidth;
-    const h = video.videoHeight;
-    if (!w || !h) return;
+    const video = this.ui?.video;
+    if (!video || video.readyState < 2) return;
 
-    if (captureCanvas.width !== w || captureCanvas.height !== h) {
-      captureCanvas.width = w;
-      captureCanvas.height = h;
+    const imageData = this._captureRoiImageData(video);
+    if (!imageData) return;
+
+    this.decodeInFlight = true;
+    try {
+      const result = decodeFrameRgba(
+        imageData.data,
+        DECODE_SIZE,
+        DECODE_SIZE,
+        this.formatsHint,
+      );
+
+      if (!result) {
+        this.pendingHit = null;
+        this.confirmCount = 0;
+        return;
+      }
+
+      const text = result.text;
+      const format = result.format;
+      const key = `${format}:${text}`;
+
+      if (this.pendingHit?.key === key) {
+        this.confirmCount += 1;
+      } else {
+        this.pendingHit = { key, text, format };
+        this.confirmCount = 1;
+      }
+
+      if (this.confirmCount < CONFIRM_FRAMES) return;
+
+      this._onDecodeSuccess(text, format);
+    } finally {
+      this.decodeInFlight = false;
     }
+  }
 
-    captureCtx.drawImage(video, 0, 0, w, h);
-    const imageData = captureCtx.getImageData(0, 0, w, h);
-    const payload = decodeQrRgba(imageData.data, w, h);
+  _onDecodeSuccess(text, format) {
+    if (text === this.lastResult && !this.options.continuous) return;
 
-    if (!payload || payload === this.lastResult) return;
-
-    this.lastResult = payload;
+    this.lastResult = text;
+    this.pendingHit = null;
+    this.confirmCount = 0;
     vibrateOnScan();
-    this.options.onScan(payload);
+    this.options.onScan(text, format);
 
     const { continuous = false, closeOnScan = true } = this.options;
 
     if (continuous) {
-      this._setStatus("QR found — keep scanning", "scanning");
+      this._setStatus(`Found ${format} — keep scanning`, "scanning");
       return;
     }
 
     this._stopScanLoop();
-    this._setStatus("QR code found", "scanning");
+    this._setStatus("Code found", "scanning");
 
     if (closeOnScan) {
       this.close();
+    }
+  }
+
+  async _applyCameraEnhancements() {
+    const track = this.stream?.getVideoTracks()?.[0];
+    if (!track?.applyConstraints) return;
+
+    const advanced = [
+      { focusMode: "continuous" },
+      { exposureMode: "continuous" },
+      { whiteBalanceMode: "continuous" },
+    ];
+
+    try {
+      await track.applyConstraints({ advanced });
+    } catch {
+      try {
+        await track.applyConstraints({
+          focusMode: "continuous",
+          exposureMode: "continuous",
+        });
+      } catch {
+        /* unsupported on this device */
+      }
     }
   }
 
@@ -206,9 +279,10 @@ class ScannerSessionImpl {
       else video.onloadedmetadata = () => resolve();
     });
     await video.play().catch(() => {});
+    await this._applyCameraEnhancements();
 
     this._startScanLoop();
-    this._setStatus("Point at a QR code", "scanning");
+    this._setStatus("Point at a QR or Data Matrix code", "scanning");
   }
 
   _showAllowFallback() {
@@ -224,7 +298,7 @@ class ScannerSessionImpl {
     activeSession = this;
 
     this.ui = createScannerOverlay();
-    const { video, status, allowBtn, closeBtn } = this.ui;
+    const { status, allowBtn, closeBtn } = this.ui;
 
     closeBtn.addEventListener("click", () => this.close());
 
@@ -259,16 +333,10 @@ class ScannerSessionImpl {
 }
 
 export const RustbarScanner = {
-  /** Load WASM module once. Safe to call multiple times. */
   async init() {
     await ensureWasm();
   },
 
-  /**
-   * Open full-screen scanner: camera + live decode.
-   * @param {OpenOptions} options
-   * @returns {Promise<ScannerSession>}
-   */
   async open(options) {
     if (!options?.onScan) {
       throw new Error("RustbarScanner.open requires onScan callback");
