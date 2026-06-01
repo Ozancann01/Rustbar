@@ -1,628 +1,469 @@
 /**
- * Rustbar — embeddable live barcode scanner (Rust + WebAssembly / rxing).
+ * Rustbar — thin JS shell: camera + DOM. Scan pipeline lives in Rust/WASM.
  */
 
-import init, { decodeFrameRgba } from "../pkg/rustbar_scanner.js";
+import init, { decodeVideoFrame, decodeImageBytes } from "../pkg/rustbar_scanner.js";
+import {
+  applyCameraEnhancements,
+  getStreamSettings,
+  maybeRepickCamera,
+  openCameraStream,
+  pickBestCameraDevice,
+  syncNativeVideoSize,
+  toggleTorch,
+  upgradeStreamIfLow,
+} from "./camera.js";
+import {
+  captureHighResStill,
+  createImageCapture,
+  isImageCaptureSupported,
+} from "./capture.js";
 import { createScannerOverlay, setOverlayStatus } from "./scanner-ui.js";
 
-const DEFAULT_DECODE_RESOLUTION = 2048;
-const FAST_DECODE_RESOLUTION = 1536;
+const DEFAULT_DECODE = 2048;
+const FAST_DECODE = 1536;
 const MAX_DECODE_4K = 2560;
-const DEFAULT_ROI_FRACTION = 0.85;
+const DEFAULT_ROI = 0.85;
 const CONFIRM_FRAMES = 1;
-const DECODE_SLOW_MS = 50;
+const SLOW_MS = 50;
 const DEFAULT_FORMATS = ["qrcode", "datamatrix"];
+const DEFAULT_STILL_INTERVAL_MS = 500;
+const MISS_STILL_THRESHOLD = 3;
+const NATIVE_DETECT_MAX = 800;
 
-const BAD_CAMERA_RE =
-  /telephoto|ultra\s*wide|ultrawide|0\.5x|fish|macro|depth/i;
-const GOOD_CAMERA_RE = /back|rear|environment|wide|camera\s*2|main/i;
-
-let wasmInitPromise = null;
-let wasmWorker = null;
-/** @type {BarcodeDetector | null | undefined} */
-let nativeDetector;
+let wasmInit = null;
+let worker = null;
 let activeSession = null;
+let nativeDetector = null;
+let nativeDetectorFormats = null;
 
-const captureCanvas = document.createElement("canvas");
-const captureCtx = captureCanvas.getContext("2d", { willReadFrequently: true });
-captureCtx.imageSmoothingEnabled = false;
+const frameCanvas = document.createElement("canvas");
+const frameCtx = frameCanvas.getContext("2d", { willReadFrequently: true });
+const detectCanvas = document.createElement("canvas");
+const detectCtx = detectCanvas.getContext("2d", { willReadFrequently: true });
 
 async function ensureWasm() {
-  if (!wasmInitPromise) {
-    wasmInitPromise = init();
-  }
-  await wasmInitPromise;
+  if (!wasmInit) wasmInit = init();
+  await wasmInit;
 }
 
-function getWasmWorker() {
-  if (!wasmWorker) {
-    wasmWorker = new WasmDecodePool();
-  }
-  return wasmWorker;
+function getWorker() {
+  if (!worker) worker = new DecodeWorker();
+  return worker;
 }
 
-class WasmDecodePool {
+class DecodeWorker {
   constructor() {
-    this.worker = new Worker(
-      new URL("./decode-worker.js", import.meta.url),
-      { type: "module" },
-    );
-    this.nextId = 0;
+    this.w = new Worker(new URL("./decode-worker.js", import.meta.url), {
+      type: "module",
+    });
+    this.id = 0;
     this.pending = new Map();
     this.ready = new Promise((resolve, reject) => {
-      const onMessage = (event) => {
-        const msg = event.data;
-        if (msg.type === "ready") {
-          this.worker.removeEventListener("message", onMessage);
+      const onMsg = (e) => {
+        const m = e.data;
+        if (m.type === "ready") {
+          this.w.removeEventListener("message", onMsg);
           resolve();
-          return;
-        }
-        if (msg.type === "error") {
-          reject(new Error(msg.message));
-          return;
-        }
-        if (msg.type === "result") {
-          const cb = this.pending.get(msg.id);
+        } else if (m.type === "error") reject(new Error(m.message));
+        else if (m.type === "result") {
+          const cb = this.pending.get(m.id);
           if (cb) {
-            this.pending.delete(msg.id);
-            cb(msg.result);
+            this.pending.delete(m.id);
+            cb(m.result);
           }
         }
       };
-      this.worker.addEventListener("message", onMessage);
-      this.worker.postMessage({ type: "init" });
+      this.w.addEventListener("message", onMsg);
+      this.w.postMessage({ type: "init" });
     });
   }
 
-  async decode(imageData, width, height, formatsHint) {
-    await this.ready;
-    const id = ++this.nextId;
-    const copy = new Uint8ClampedArray(imageData.data);
+  decode(buffer, frameWidth, frameHeight, roi, target, formatsHint) {
+    const job = ++this.id;
+    const copy = new Uint8ClampedArray(buffer);
     return new Promise((resolve) => {
-      this.pending.set(id, resolve);
-      this.worker.postMessage(
+      this.pending.set(job, resolve);
+      this.w.postMessage(
         {
           type: "decode",
-          id,
+          id: job,
           buffer: copy.buffer,
-          width,
-          height,
+          frameWidth,
+          frameHeight,
+          roiFraction: roi,
+          targetSize: target,
           formatsHint,
         },
         [copy.buffer],
       );
     });
   }
-}
 
-async function ensureNativeDetector() {
-  if (nativeDetector !== undefined) return nativeDetector;
-  if (typeof BarcodeDetector === "undefined") {
-    nativeDetector = null;
-    return null;
-  }
-  try {
-    const supported = await BarcodeDetector.getSupportedFormats();
-    if (!supported.includes("qr_code")) {
-      nativeDetector = null;
-      return null;
-    }
-    nativeDetector = new BarcodeDetector({ formats: ["qr_code"] });
-  } catch {
-    nativeDetector = null;
-  }
-  return nativeDetector;
-}
-
-async function tryNativeQrDecode(formats, imageData, width, height) {
-  const wantsQr = formats.some((f) =>
-    ["qrcode", "qr", "qr_code"].includes(f.toLowerCase()),
-  );
-  if (!wantsQr) return null;
-
-  const detector = await ensureNativeDetector();
-  if (!detector) return null;
-
-  try {
-    captureCanvas.width = width;
-    captureCanvas.height = height;
-    captureCtx.putImageData(imageData, 0, 0);
-    const bitmap = await createImageBitmap(captureCanvas);
-    const codes = await detector.detect(bitmap);
-    bitmap.close();
-    if (!codes?.length || !codes[0].rawValue) return null;
-    return { text: codes[0].rawValue, format: "qrcode" };
-  } catch {
-    return null;
+  decodeImage(buffer, formatsHint) {
+    const job = ++this.id;
+    const copy = buffer.slice(0);
+    return new Promise((resolve) => {
+      this.pending.set(job, resolve);
+      this.w.postMessage(
+        { type: "decodeImage", id: job, buffer: copy.buffer, formatsHint },
+        [copy.buffer],
+      );
+    });
   }
 }
 
-function formatsToHint(formats) {
+function formatsHint(formats) {
   return formats.map((f) => f.trim().toLowerCase()).join(",");
 }
 
-function clampDecodeResolution(n, prefer4K) {
-  const v = Number(n) || DEFAULT_DECODE_RESOLUTION;
+function clampDecode(n, prefer4K) {
   const max = prefer4K ? MAX_DECODE_4K : 2048;
+  const v = Number(n) || DEFAULT_DECODE;
   return Math.min(max, Math.max(1024, Math.round(v / 256) * 256));
 }
 
-function scoreCamera(cam) {
-  const label = (cam.label || "").toLowerCase();
-  let score = 0;
-  if (GOOD_CAMERA_RE.test(label)) score += 10;
-  if (BAD_CAMERA_RE.test(label)) score -= 20;
-  if (/front|user|selfie|face/i.test(label)) score -= 30;
-  if (label.length > 0) score += 2;
-  return score;
-}
+async function ensureNativeDetector(formats) {
+  if (typeof BarcodeDetector === "undefined") return null;
+  const wanted = formats.map((f) => f.trim().toLowerCase());
+  const onlyQr = wanted.every((f) => f === "qrcode" || f === "qr");
+  if (!onlyQr) return null;
 
-async function pickBestCameraDevice(excludeId) {
-  const devices = await navigator.mediaDevices.enumerateDevices();
-  const cams = devices.filter((d) => d.kind === "videoinput");
-  if (cams.length === 0) return undefined;
+  const supported = (await BarcodeDetector.getSupportedFormats?.()) ?? [];
+  if (!supported.includes("qr_code")) return null;
 
-  const scored = cams
-    .map((cam) => ({ cam, score: scoreCamera(cam) }))
-    .filter((s) => s.cam.deviceId !== excludeId || cams.length === 1)
-    .sort((a, b) => b.score - a.score);
-
-  const best = scored.find((s) => s.score > -10) ?? scored[0];
-  return best?.cam.deviceId;
-}
-
-function buildVideoConstraints(deviceId, prefer4K) {
-  const base = deviceId ? { deviceId: { exact: deviceId } } : {};
-  const facing = { facingMode: { ideal: "environment" } };
-
-  const attempts = [
-    { ...base, ...facing, width: { ideal: 3840 }, height: { ideal: 2160 } },
-    { ...base, ...facing, width: { ideal: 1920 }, height: { ideal: 1080 } },
-    { ...facing, width: { ideal: 1920 }, height: { ideal: 1080 } },
-    { facingMode: "environment" },
-  ];
-
-  if (!prefer4K) {
-    return attempts;
+  if (
+    nativeDetector &&
+    nativeDetectorFormats === wanted.join(",")
+  ) {
+    return nativeDetector;
   }
-  return attempts;
+
+  nativeDetector = new BarcodeDetector({ formats: ["qr_code"] });
+  nativeDetectorFormats = wanted.join(",");
+  return nativeDetector;
 }
 
-async function openCameraStream(deviceId, prefer4K) {
-  const attempts = buildVideoConstraints(deviceId, prefer4K);
-  let lastErr;
-  for (const video of attempts) {
-    try {
-      return await navigator.mediaDevices.getUserMedia({ audio: false, video });
-    } catch (e) {
-      lastErr = e;
-    }
+async function tryNativeDetect(video, formats) {
+  const detector = await ensureNativeDetector(formats);
+  if (!detector) return null;
+
+  const w = video.videoWidth;
+  const h = video.videoHeight;
+  if (!w || !h) return null;
+
+  const scale = Math.min(1, NATIVE_DETECT_MAX / Math.max(w, h));
+  const dw = Math.max(1, Math.round(w * scale));
+  const dh = Math.max(1, Math.round(h * scale));
+  detectCanvas.width = dw;
+  detectCanvas.height = dh;
+  detectCtx.drawImage(video, 0, 0, dw, dh);
+
+  try {
+    const codes = await detector.detect(detectCanvas);
+    const hit = codes?.[0];
+    if (!hit?.rawValue) return null;
+    return { text: hit.rawValue, format: "qrcode" };
+  } catch {
+    return null;
   }
-  throw lastErr ?? new Error("Could not open camera");
 }
 
-function vibrateOnScan() {
-  if (navigator.vibrate) navigator.vibrate(40);
+/** Copy full camera frame to RGBA buffer (only JS step before Rust). */
+function captureFrameRgba(video) {
+  const w = video.videoWidth;
+  const h = video.videoHeight;
+  if (!w || !h) return null;
+  frameCanvas.width = w;
+  frameCanvas.height = h;
+  frameCtx.drawImage(video, 0, 0, w, h);
+  return { data: frameCtx.getImageData(0, 0, w, h).data, width: w, height: h };
 }
 
-/**
- * @typedef {Object} OpenOptions
- * @property {(text: string, format: string) => void} onScan
- * @property {(error: Error) => void} [onError]
- * @property {(lastText?: string) => void} [onClose]
- * @property {string[]} [formats]
- * @property {number} [decodeResolution]
- * @property {number} [roiFraction]
- * @property {boolean} [prefer4K]
- * @property {boolean} [useWorker=true]
- * @property {boolean} [continuous]
- * @property {boolean} [closeOnScan]
- */
-
-class ScannerSessionImpl {
-  constructor(options) {
-    this.options = options;
-    this.formats = options.formats?.length ? options.formats : DEFAULT_FORMATS;
-    this.formatsHint = formatsToHint(this.formats);
-    this.prefer4K = options.prefer4K ?? false;
-    this.decodeResolution = clampDecodeResolution(
-      options.decodeResolution ?? DEFAULT_DECODE_RESOLUTION,
-      this.prefer4K,
-    );
-    this.roiFraction = Math.min(
-      0.95,
-      Math.max(0.5, options.roiFraction ?? DEFAULT_ROI_FRACTION),
-    );
-    this.useWorker = options.useWorker !== false;
+class Session {
+  constructor(opts) {
+    this.opts = opts;
+    this.formats = opts.formats?.length ? opts.formats : DEFAULT_FORMATS;
+    this.hint = formatsHint(this.formats);
+    this.prefer4K = opts.prefer4K ?? false;
+    this.decodeRes = clampDecode(opts.decodeResolution, this.prefer4K);
+    this.roi = Math.min(0.95, Math.max(0.5, opts.roiFraction ?? DEFAULT_ROI));
+    this.useWorker = opts.useWorker !== false;
+    this.adaptiveDecode = opts.adaptiveDecode === true;
+    this.highResStills =
+      opts.highResStills !== false && isImageCaptureSupported();
+    this.stillIntervalMs = opts.stillIntervalMs ?? DEFAULT_STILL_INTERVAL_MS;
     this.closed = false;
     this.stream = null;
+    this.imageCapture = null;
     this.scanning = false;
-    this.decodeInFlight = false;
-    this.useFastDecode = false;
+    this.videoDecodeBusy = false;
+    this.stillDecodeBusy = false;
+    this.fastNext = false;
     this.torchOn = false;
-    this.cameraRepicked = false;
-    this.rafId = null;
-    this.pendingHit = null;
-    this.confirmCount = 0;
-    this.lastResult = "";
+    this.repicked = false;
+    this.raf = null;
+    this.hit = null;
+    this.hitN = 0;
+    this.missCount = 0;
+    this.lastStillAt = 0;
     this.ui = null;
-    this._onVisibility = null;
+    this.last = "";
   }
 
   close() {
     if (this.closed) return;
     this.closed = true;
-    this._teardown();
-    this.options.onClose?.(this.lastResult);
+    if (this.raf) cancelAnimationFrame(this.raf);
+    this.stream?.getTracks().forEach((t) => t.stop());
+    this.ui?.destroy();
+    this.opts.onClose?.(this.last);
     if (activeSession === this) activeSession = null;
   }
 
-  _teardown() {
-    this._stopScanLoop();
-    if (this.stream) {
-      for (const track of this.stream.getTracks()) track.stop();
-      this.stream = null;
+  _decodeSize() {
+    if (this.adaptiveDecode && this.fastNext) {
+      this.fastNext = false;
+      return FAST_DECODE;
     }
-    if (this.ui) {
-      this.ui.video.srcObject = null;
-      this.ui.destroy();
-      this.ui = null;
+    return this.decodeRes;
+  }
+
+  _handleResult(result) {
+    if (!result) {
+      this.hit = null;
+      this.hitN = 0;
+      this.missCount++;
+      return false;
     }
-    if (this._onVisibility) {
-      document.removeEventListener("visibilitychange", this._onVisibility);
-      this._onVisibility = null;
+
+    this.missCount = 0;
+    const key = `${result.format}:${result.text}`;
+    if (this.hit?.key === key) this.hitN++;
+    else {
+      this.hit = { key, ...result };
+      this.hitN = 1;
     }
-  }
+    if (this.hitN < CONFIRM_FRAMES) return false;
 
-  _setStatus(text, kind = "") {
-    if (this.ui) setOverlayStatus(this.ui.status, text, kind);
-  }
+    this.last = result.text;
+    this.opts.onScan(result.text, result.format);
+    if (navigator.vibrate) navigator.vibrate(40);
 
-  _stopScanLoop() {
-    if (this.rafId !== null) {
-      cancelAnimationFrame(this.rafId);
-      this.rafId = null;
+    if (!this.opts.continuous) {
+      this.scanning = false;
+      if (this.opts.closeOnScan !== false) this.close();
     }
-    this.scanning = false;
-    this.decodeInFlight = false;
-    this.useFastDecode = false;
-    this.pendingHit = null;
-    this.confirmCount = 0;
+    return true;
   }
 
-  _startScanLoop() {
-    this._stopScanLoop();
-    this.scanning = true;
-    const tick = () => {
-      if (!this.scanning || this.closed) return;
-      if (!this.decodeInFlight) {
-        this._tryDecodeFrame();
-      }
-      this.rafId = requestAnimationFrame(tick);
-    };
-    this.rafId = requestAnimationFrame(tick);
-  }
-
-  _currentDecodeSize() {
-    if (this.useFastDecode) {
-      this.useFastDecode = false;
-      return FAST_DECODE_RESOLUTION;
-    }
-    return this.decodeResolution;
-  }
-
-  _captureRoiImageData(video, decodeSize) {
-    const vw = video.videoWidth;
-    const vh = video.videoHeight;
-    if (!vw || !vh) return null;
-
-    const side = Math.floor(Math.min(vw, vh) * this.roiFraction);
-    const sx = Math.floor((vw - side) / 2);
-    const sy = Math.floor((vh - side) / 2);
-    const target = Math.min(decodeSize, side);
-
-    captureCanvas.width = target;
-    captureCanvas.height = target;
-    captureCtx.imageSmoothingEnabled = false;
-    captureCtx.drawImage(video, sx, sy, side, side, 0, 0, target, target);
-    return captureCtx.getImageData(0, 0, target, target);
-  }
-
-  async _decodeFrame(imageData, width, height) {
-    const native = await tryNativeQrDecode(
-      this.formats,
-      imageData,
-      width,
-      height,
-    );
-    if (native) return native;
-
+  async _decodeRust(frame, target) {
     if (this.useWorker) {
-      return getWasmWorker().decode(
-        imageData,
-        width,
-        height,
-        this.formatsHint,
+      await getWorker().ready;
+      return getWorker().decode(
+        frame.data.buffer,
+        frame.width,
+        frame.height,
+        this.roi,
+        target,
+        this.hint,
       );
     }
-
     await ensureWasm();
-    return decodeFrameRgba(
-      imageData.data,
-      width,
-      height,
-      this.formatsHint,
+    const r = decodeVideoFrame(
+      frame.data,
+      frame.width,
+      frame.height,
+      this.roi,
+      target,
+      this.hint,
     );
+    return r ? { text: r.text, format: r.format } : null;
   }
 
-  async _tryDecodeFrame() {
+  async _decodeStillBlob(blob) {
+    const buf = await blob.arrayBuffer();
+    if (this.useWorker) {
+      await getWorker().ready;
+      return getWorker().decodeImage(buf, this.hint);
+    }
+    await ensureWasm();
+    const r = decodeImageBytes(new Uint8Array(buf), this.hint);
+    return r ? { text: r.text, format: r.format } : null;
+  }
+
+  async _processVideoFrame(frame) {
+    const target = this._decodeSize();
+    const t0 = performance.now();
+    try {
+      const native = await tryNativeDetect(this.ui.video, this.formats);
+      if (native && this._handleResult(native)) return;
+
+      const result = await this._decodeRust(frame, target);
+      if (this.adaptiveDecode && performance.now() - t0 > SLOW_MS) {
+        this.fastNext = true;
+      }
+      this._handleResult(result);
+    } finally {
+      this.videoDecodeBusy = false;
+    }
+  }
+
+  async _maybeCaptureStill() {
+    if (!this.highResStills || !this.imageCapture || this.stillDecodeBusy) {
+      return;
+    }
+
+    const now = performance.now();
+    const dueByTime = now - this.lastStillAt >= this.stillIntervalMs;
+    const dueByMiss = this.missCount >= MISS_STILL_THRESHOLD;
+    if (!dueByTime && !dueByMiss) return;
+
+    this.lastStillAt = now;
+    this.stillDecodeBusy = true;
+    try {
+      const blob = await captureHighResStill(this.imageCapture);
+      if (!blob || this.closed || !this.scanning) return;
+      const result = await this._decodeStillBlob(blob);
+      this._handleResult(result);
+    } catch {
+      /* still capture failed */
+    } finally {
+      this.stillDecodeBusy = false;
+    }
+  }
+
+  _tick() {
     const video = this.ui?.video;
     if (!video || video.readyState < 2) return;
 
-    const decodeSize = this._currentDecodeSize();
-    const imageData = this._captureRoiImageData(video, decodeSize);
-    if (!imageData) return;
-
-    this.decodeInFlight = true;
-    const t0 = performance.now();
-    try {
-      const result = await this._decodeFrame(imageData, decodeSize, decodeSize);
-
-      const elapsed = performance.now() - t0;
-      if (elapsed > DECODE_SLOW_MS) {
-        this.useFastDecode = true;
-      }
-
-      if (!result) {
-        this.pendingHit = null;
-        this.confirmCount = 0;
-        return;
-      }
-
-      const text = result.text;
-      const format = result.format;
-      const key = `${format}:${text}`;
-
-      if (this.pendingHit?.key === key) {
-        this.confirmCount += 1;
-      } else {
-        this.pendingHit = { key, text, format };
-        this.confirmCount = 1;
-      }
-
-      if (this.confirmCount < CONFIRM_FRAMES) return;
-
-      this._onDecodeSuccess(text, format);
-    } finally {
-      this.decodeInFlight = false;
-    }
-  }
-
-  _onDecodeSuccess(text, format) {
-    if (text === this.lastResult && !this.options.continuous) return;
-
-    this.lastResult = text;
-    this.pendingHit = null;
-    this.confirmCount = 0;
-    vibrateOnScan();
-    this.options.onScan(text, format);
-
-    const { continuous = false, closeOnScan = true } = this.options;
-
-    if (continuous) {
-      this._setStatus(`Found ${format} — keep scanning`, "scanning");
-      return;
-    }
-
-    this._stopScanLoop();
-    this._setStatus("Code found", "scanning");
-
-    if (closeOnScan) {
-      this.close();
-    }
-  }
-
-  async _applyCameraEnhancements() {
-    const track = this.stream?.getVideoTracks()?.[0];
-    if (!track?.applyConstraints) return;
-
-    const advanced = [
-      { focusMode: "continuous" },
-      { exposureMode: "continuous" },
-      { whiteBalanceMode: "continuous" },
-    ];
-
-    try {
-      await track.applyConstraints({ advanced });
-    } catch {
-      try {
-        await track.applyConstraints({
-          focusMode: "continuous",
-          exposureMode: "continuous",
+    if (!this.videoDecodeBusy) {
+      const frame = captureFrameRgba(video);
+      if (frame) {
+        this.videoDecodeBusy = true;
+        const snapshot = {
+          data: new Uint8ClampedArray(frame.data),
+          width: frame.width,
+          height: frame.height,
+        };
+        this._processVideoFrame(snapshot).catch(() => {
+          this.videoDecodeBusy = false;
         });
-      } catch {
-        /* unsupported */
       }
     }
 
-    const caps = track.getCapabilities?.();
-    if (caps?.torch && this.ui?.torchBtn) {
-      this.ui.torchBtn.hidden = false;
-    }
-    if (caps?.zoom) {
-      const zoom = Math.min(1.2, caps.zoom.max ?? 1.2);
-      try {
-        await track.applyConstraints({ advanced: [{ zoom }] });
-      } catch {
-        /* optional */
-      }
-    }
+    void this._maybeCaptureStill();
   }
 
-  async _toggleTorch() {
-    const track = this.stream?.getVideoTracks()?.[0];
-    if (!track?.applyConstraints || !this.ui?.torchBtn) return;
-    this.torchOn = !this.torchOn;
-    try {
-      await track.applyConstraints({ advanced: [{ torch: this.torchOn }] });
-      this.ui.torchBtn.classList.toggle("rustbar-overlay__torch--on", this.torchOn);
-      this.ui.torchBtn.textContent = this.torchOn ? "Flash off" : "Flash";
-    } catch {
-      this.torchOn = false;
-    }
+  _loop() {
+    if (!this.scanning || this.closed) return;
+    this._tick();
+    this.raf = requestAnimationFrame(() => this._loop());
   }
 
-  async _maybeRepickCamera() {
-    if (this.cameraRepicked || this.closed) return;
-    const track = this.stream?.getVideoTracks()?.[0];
-    const currentId = track?.getSettings?.()?.deviceId;
-    const betterId = await pickBestCameraDevice(currentId);
-    if (!betterId || betterId === currentId) return;
-
-    const devices = await navigator.mediaDevices.enumerateDevices();
-    const betterCam = devices.find((d) => d.deviceId === betterId);
-    const currentCam = devices.find((d) => d.deviceId === currentId);
-    if (!betterCam || !currentCam) return;
-    if (scoreCamera(betterCam) <= scoreCamera(currentCam)) return;
-
-    this.cameraRepicked = true;
-    for (const t of this.stream.getTracks()) t.stop();
-
-    try {
-      this.stream = await openCameraStream(betterId, this.prefer4K);
-      this.ui.video.srcObject = this.stream;
-      await this.ui.video.play().catch(() => {});
-      await this._applyCameraEnhancements();
-      console.debug("Rustbar: switched to better camera", betterCam.label);
-    } catch {
-      this.cameraRepicked = false;
-    }
+  _notifyCameraReady() {
+    const info = getStreamSettings(this.stream);
+    this.opts.onCameraReady?.({
+      width: info.width,
+      height: info.height,
+      frameRate: info.frameRate,
+      deviceLabel: info.deviceLabel,
+      imageCapture: this.highResStills,
+    });
   }
 
   async _startCamera() {
-    if (this.closed) return;
-
     if (!navigator.mediaDevices?.getUserMedia) {
-      const err = new Error("Camera not supported in this browser");
-      this._setStatus(err.message, "error");
-      this.options.onError?.(err);
-      return;
+      throw new Error("Camera not supported");
     }
-
-    this._setStatus("Requesting camera…");
-    if (this.ui.allowBtn) this.ui.allowBtn.hidden = true;
 
     const deviceId = await pickBestCameraDevice().catch(() => undefined);
-
-    try {
-      this.stream = await openCameraStream(deviceId, this.prefer4K);
-    } catch (err) {
-      const error = err instanceof Error ? err : new Error(String(err));
-      this._setStatus(
-        error.message || "Could not access camera — use HTTPS",
-        "error",
-      );
-      this._showAllowFallback();
-      this.options.onError?.(error);
-      return;
-    }
-
+    this.stream = await openCameraStream(deviceId);
     const video = this.ui.video;
     video.srcObject = this.stream;
     video.setAttribute("playsinline", "");
     video.muted = true;
-
-    await new Promise((resolve) => {
-      if (video.readyState >= 2) resolve();
-      else video.onloadedmetadata = () => resolve();
+    await new Promise((r) => {
+      if (video.readyState >= 2) r();
+      else video.onloadedmetadata = r;
     });
     await video.play().catch(() => {});
-    await this._applyCameraEnhancements();
-    await this._maybeRepickCamera();
+    syncNativeVideoSize(video);
+    await applyCameraEnhancements(this.stream, this.ui.torchBtn);
 
-    const track = this.stream.getVideoTracks()[0];
-    const settings = track?.getSettings?.();
-    if (settings?.width && settings?.height) {
-      if (this.prefer4K && settings.width >= 1920) {
-        this.decodeResolution = clampDecodeResolution(
-          MAX_DECODE_4K,
-          true,
-        );
-      }
-      console.debug(
-        `Rustbar camera: ${settings.width}×${settings.height} decode=${this.decodeResolution} roi=${this.roiFraction}`,
-      );
+    if (!this.repicked) {
+      this.repicked = true;
+      this.stream = await maybeRepickCamera(this.stream, this.prefer4K, video);
+      syncNativeVideoSize(video);
     }
 
-    this._startScanLoop();
-    this._setStatus("Point at a QR or Data Matrix code", "scanning");
-  }
+    this.stream = await upgradeStreamIfLow(this.stream, video);
+    syncNativeVideoSize(video);
 
-  _showAllowFallback() {
-    if (!this.ui?.allowBtn || this.closed) return;
-    this.ui.allowBtn.hidden = false;
-    this._setStatus("Tap Allow camera to continue", "error");
+    this.imageCapture = this.highResStills
+      ? createImageCapture(this.stream)
+      : null;
+    if (!this.imageCapture) this.highResStills = false;
+
+    const s = getStreamSettings(this.stream);
+    if (this.prefer4K && s.width >= 1920) {
+      this.decodeRes = clampDecode(MAX_DECODE_4K, true);
+    }
+
+    this._notifyCameraReady();
   }
 
   async open() {
-    if (activeSession && activeSession !== this) {
-      activeSession.close();
-    }
+    if (activeSession) activeSession.close();
     activeSession = this;
 
     this.ui = createScannerOverlay();
-    const { status, allowBtn, closeBtn, torchBtn } = this.ui;
-
-    closeBtn.addEventListener("click", () => this.close());
-    torchBtn.addEventListener("click", () => this._toggleTorch());
-
-    allowBtn.addEventListener("click", () => {
-      allowBtn.hidden = true;
-      this._startCamera();
-    });
-
-    this._onVisibility = () => {
-      if (document.hidden) {
-        this._stopScanLoop();
-      } else if (this.stream && !this.closed) {
-        this._startScanLoop();
-      }
+    this.ui.closeBtn.onclick = () => this.close();
+    this.ui.torchBtn.onclick = async () => {
+      this.torchOn = await toggleTorch(this.stream, this.torchOn);
+      this.ui.torchBtn.classList.toggle(
+        "rustbar-overlay__torch--on",
+        this.torchOn,
+      );
+      this.ui.torchBtn.textContent = this.torchOn ? "Flash off" : "Flash";
     };
-    document.addEventListener("visibilitychange", this._onVisibility);
+    this.ui.allowBtn.onclick = () => {
+      this.ui.allowBtn.hidden = true;
+      this._runCamera()
+        .then(() => this._loop())
+        .catch((e) => this._cameraError(e));
+    };
 
-    setOverlayStatus(status, "Loading scanner…");
+    await ensureWasm();
+    if (this.useWorker) await getWorker().ready;
 
-    try {
-      await ensureWasm();
-      if (this.useWorker) {
-        await getWasmWorker().ready;
-      }
-    } catch (err) {
-      const error = err instanceof Error ? err : new Error(String(err));
-      this._setStatus("Failed to load scanner", "error");
-      this.options.onError?.(error);
-      return this;
-    }
+    setOverlayStatus(this.ui.status, "Requesting camera…");
+    this.ui.allowBtn.hidden = true;
+    await this._runCamera();
+    this._loop();
+  }
 
+  async _runCamera() {
     await this._startCamera();
-    return this;
+    this.scanning = true;
+    this.lastStillAt = performance.now();
+    setOverlayStatus(this.ui.status, "Point at a QR or Data Matrix code", "scanning");
+  }
+
+  _cameraError(e) {
+    this.ui.allowBtn.hidden = false;
+    setOverlayStatus(this.ui.status, e.message, "error");
+    this.opts.onError?.(e);
   }
 }
 
 export const RustbarScanner = {
-  async init() {
-    await ensureWasm();
-  },
-
+  init: ensureWasm,
   async open(options) {
-    if (!options?.onScan) {
-      throw new Error("RustbarScanner.open requires onScan callback");
-    }
+    if (!options?.onScan) throw new Error("RustbarScanner.open requires onScan");
     await ensureWasm();
-    const session = new ScannerSessionImpl(options);
-    await session.open();
-    return {
-      close: () => session.close(),
-    };
+    const s = new Session(options);
+    await s.open();
+    return { close: () => s.close() };
   },
 };

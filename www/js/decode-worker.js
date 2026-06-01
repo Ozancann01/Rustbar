@@ -1,12 +1,10 @@
 /**
- * Off-thread WASM barcode decode (keeps camera preview smooth).
+ * WASM worker — all image processing and decode run in Rust.
  */
 
-import init, { decodeFrameRgba } from "../pkg/rustbar_scanner.js";
+import init, { decodeVideoFrame, decodeImageBytes } from "../pkg/rustbar_scanner.js";
 
 const wasmReady = init();
-let jobId = 0;
-const pending = new Map();
 
 self.onmessage = async (event) => {
   const { type } = event.data;
@@ -22,11 +20,26 @@ self.onmessage = async (event) => {
   }
 
   if (type === "decode") {
-    const { id, buffer, width, height, formatsHint } = event.data;
+    const {
+      id,
+      buffer,
+      frameWidth,
+      frameHeight,
+      roiFraction,
+      targetSize,
+      formatsHint,
+    } = event.data;
     try {
       await wasmReady;
-      const data = new Uint8Array(buffer);
-      const result = decodeFrameRgba(data, width, height, formatsHint);
+      const rgba = new Uint8Array(buffer);
+      const result = decodeVideoFrame(
+        rgba,
+        frameWidth,
+        frameHeight,
+        roiFraction,
+        targetSize,
+        formatsHint,
+      );
       self.postMessage({
         type: "result",
         id,
@@ -35,12 +48,26 @@ self.onmessage = async (event) => {
           : null,
       });
     } catch (err) {
+      self.postMessage({ type: "result", id, result: null, error: String(err) });
+    }
+    return;
+  }
+
+  if (type === "decodeImage") {
+    const { id, buffer, formatsHint } = event.data;
+    try {
+      await wasmReady;
+      const bytes = new Uint8Array(buffer);
+      const result = decodeImageBytes(bytes, formatsHint);
       self.postMessage({
         type: "result",
         id,
-        result: null,
-        error: String(err),
+        result: result
+          ? { text: result.text, format: result.format }
+          : null,
       });
+    } catch (err) {
+      self.postMessage({ type: "result", id, result: null, error: String(err) });
     }
   }
 };

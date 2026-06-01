@@ -21,10 +21,14 @@ scanBtn.addEventListener("click", async () => {
         formatEl.hidden = false;
       }
     },
+    onCameraReady(info) {
+      console.log("Camera:", info.width, "x", info.height, info);
+    },
     onError(err) {
       console.error("Rustbar:", err);
     },
     formats: ["qrcode", "datamatrix"],
+    prefer4K: true,
     continuous: false,
     closeOnScan: true,
   });
