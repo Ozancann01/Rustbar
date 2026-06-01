@@ -1,0 +1,6 @@
+/target/
+scanner/pkg/
+www/pkg/
+**/*.wasm
+.local-certs/
+.DS_Store

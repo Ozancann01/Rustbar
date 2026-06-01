@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover"
+    />
+    <meta name="theme-color" content="#0a0a0f" />
+    <title>Rustbar QR Scanner</title>
+    <link rel="stylesheet" href="css/demo.css" />
+  </head>
+  <body>
+    <main class="demo">
+      <h1>Rustbar</h1>
+      <p class="demo-lead">
+        Embeddable live QR scanner — Rust + WebAssembly. Tap below to open the
+        camera and scan.
+      </p>
+      <button type="button" id="scan-btn" class="demo-btn">Scan QR code</button>
+      <p id="demo-result" class="demo-result" hidden></p>
+      <p class="demo-hint">Camera requires HTTPS — use GitHub Pages or localhost.</p>
+    </main>
+    <script type="module" src="js/demo.js"></script>
+  </body>
+</html>

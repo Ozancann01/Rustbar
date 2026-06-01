@@ -1,0 +1,195 @@
+/* Scoped styles for the injectable Rustbar scanner overlay */
+.rustbar-overlay {
+  --rb-bg: #0a0a0f;
+  --rb-surface: #14141c;
+  --rb-accent: #6ee7b7;
+  --rb-accent-dim: #34d399;
+  --rb-text: #f4f4f5;
+  --rb-muted: #a1a1aa;
+  --rb-danger: #f87171;
+  --rb-safe-top: env(safe-area-inset-top, 0px);
+  --rb-safe-bottom: env(safe-area-inset-bottom, 0px);
+  --rb-frame-size: min(72vw, 280px);
+
+  position: fixed;
+  inset: 0;
+  z-index: 2147483646;
+  display: flex;
+  flex-direction: column;
+  background: var(--rb-bg);
+  color: var(--rb-text);
+  font-family:
+    system-ui,
+    -apple-system,
+    "Segoe UI",
+    Roboto,
+    Ubuntu,
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+  touch-action: manipulation;
+  padding:
+    calc(12px + var(--rb-safe-top))
+    16px
+    calc(16px + var(--rb-safe-bottom));
+}
+
+.rustbar-overlay *,
+.rustbar-overlay *::before,
+.rustbar-overlay *::after {
+  box-sizing: border-box;
+}
+
+.rustbar-overlay__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.rustbar-overlay__title {
+  margin: 0;
+  font-size: 1.1rem;
+  font-weight: 700;
+}
+
+.rustbar-overlay__close {
+  appearance: none;
+  border: 1px solid rgb(255 255 255 / 12%);
+  background: var(--rb-surface);
+  color: var(--rb-text);
+  padding: 10px 16px;
+  border-radius: 10px;
+  font-size: 0.9rem;
+  font-weight: 600;
+  cursor: pointer;
+  min-height: 44px;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.rustbar-overlay__body {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 0;
+}
+
+.rustbar-overlay__viewport {
+  position: relative;
+  flex: 1;
+  min-height: 200px;
+  border-radius: 16px;
+  overflow: hidden;
+  background: var(--rb-surface);
+  box-shadow: 0 8px 32px rgb(0 0 0 / 45%);
+}
+
+.rustbar-overlay__video {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.rustbar-overlay__frame {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  pointer-events: none;
+}
+
+.rustbar-overlay__frame::before {
+  content: "";
+  width: var(--rb-frame-size);
+  height: var(--rb-frame-size);
+  border: 2px solid rgb(110 231 183 / 35%);
+  border-radius: 12px;
+  box-shadow: 0 0 0 9999px rgb(0 0 0 / 45%);
+}
+
+.rustbar-overlay__corner {
+  position: absolute;
+  width: 24px;
+  height: 24px;
+  border: 3px solid var(--rb-accent);
+}
+
+.rustbar-overlay__corner--tl {
+  top: calc(50% - var(--rb-frame-size) / 2 - 2px);
+  left: calc(50% - var(--rb-frame-size) / 2 - 2px);
+  border-right: none;
+  border-bottom: none;
+  border-radius: 8px 0 0;
+}
+
+.rustbar-overlay__corner--tr {
+  top: calc(50% - var(--rb-frame-size) / 2 - 2px);
+  right: calc(50% - var(--rb-frame-size) / 2 - 2px);
+  border-left: none;
+  border-bottom: none;
+  border-radius: 0 8px 0 0;
+}
+
+.rustbar-overlay__corner--bl {
+  bottom: calc(50% - var(--rb-frame-size) / 2 - 2px);
+  left: calc(50% - var(--rb-frame-size) / 2 - 2px);
+  border-right: none;
+  border-top: none;
+  border-radius: 0 0 0 8px;
+}
+
+.rustbar-overlay__corner--br {
+  bottom: calc(50% - var(--rb-frame-size) / 2 - 2px);
+  right: calc(50% - var(--rb-frame-size) / 2 - 2px);
+  border-left: none;
+  border-top: none;
+  border-radius: 0 0 8px;
+}
+
+.rustbar-overlay__status {
+  margin: 0;
+  text-align: center;
+  font-size: 0.9rem;
+  color: var(--rb-muted);
+  min-height: 1.4em;
+}
+
+.rustbar-overlay__status--scanning {
+  color: var(--rb-accent-dim);
+}
+
+.rustbar-overlay__status--error {
+  color: var(--rb-danger);
+}
+
+.rustbar-overlay__allow {
+  appearance: none;
+  border: none;
+  background: linear-gradient(135deg, #059669, #10b981);
+  color: #022c22;
+  padding: 14px 24px;
+  border-radius: 12px;
+  font-size: 1rem;
+  font-weight: 600;
+  cursor: pointer;
+  min-height: 48px;
+  width: 100%;
+  max-width: 320px;
+  margin: 0 auto;
+  display: block;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.rustbar-overlay__allow[hidden] {
+  display: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rustbar-overlay__close:active,
+  .rustbar-overlay__allow:active {
+    transform: none;
+  }
+}
