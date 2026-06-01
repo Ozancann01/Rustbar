@@ -8,6 +8,8 @@ use std::collections::HashSet;
 use std::str::FromStr;
 use wasm_bindgen::prelude::*;
 
+const MAX_SCALE_DIM: u32 = 2560;
+
 #[wasm_bindgen]
 pub struct FrameDecodeResult {
     text: String,
@@ -28,7 +30,6 @@ impl FrameDecodeResult {
 }
 
 /// Decode barcodes in an RGBA buffer (`width` × `height`, 4 bytes/pixel).
-/// `formats_hint` — comma-separated names, e.g. `"qrcode,datamatrix"`.
 #[wasm_bindgen(js_name = decodeFrameRgba)]
 pub fn decode_frame_rgba(
     data: &[u8],
@@ -47,7 +48,6 @@ pub fn decode_frame_rgba(
     decode_luma_multiscale(luma, width, height, formats_hint)
 }
 
-/// Decode from PNG/JPEG/WebP bytes.
 #[wasm_bindgen(js_name = decodeImageBytes)]
 pub fn decode_image_bytes(bytes: &[u8], formats_hint: &str) -> Option<FrameDecodeResult> {
     let img = image::load_from_memory(bytes).ok()?.to_luma8();
@@ -55,7 +55,6 @@ pub fn decode_image_bytes(bytes: &[u8], formats_hint: &str) -> Option<FrameDecod
     decode_luma_multiscale(img.into_raw(), width, height, formats_hint)
 }
 
-/// Backward-compatible alias (text only).
 #[wasm_bindgen(js_name = decodeQrRgba)]
 pub fn decode_qr_rgba(data: &[u8], width: u32, height: u32) -> Option<String> {
     decode_frame_rgba(data, width, height, "qrcode,datamatrix").map(|r| r.text)
@@ -88,9 +87,15 @@ fn contrast_stretch(luma: &mut [u8]) {
     }
 }
 
-fn downscale_luma(luma: &[u8], width: u32, height: u32, scale: f32) -> (Vec<u8>, u32, u32) {
-    let nw = ((width as f32) * scale).max(64.0) as u32;
-    let nh = ((height as f32) * scale).max(64.0) as u32;
+fn scale_luma(luma: &[u8], width: u32, height: u32, scale: f32) -> (Vec<u8>, u32, u32) {
+    let mut nw = ((width as f32) * scale).max(64.0) as u32;
+    let mut nh = ((height as f32) * scale).max(64.0) as u32;
+    let max_side = nw.max(nh);
+    if max_side > MAX_SCALE_DIM {
+        let cap = MAX_SCALE_DIM as f32 / max_side as f32;
+        nw = (nw as f32 * cap) as u32;
+        nh = (nh as f32 * cap) as u32;
+    }
     let mut out = Vec::with_capacity((nw * nh) as usize);
     for y in 0..nh {
         let sy = (y as f32 / nh as f32 * height as f32) as u32;
@@ -116,8 +121,15 @@ fn decode_luma_multiscale(
         return Some(frame);
     }
 
-    let (luma2, w2, h2) = downscale_luma(&luma, width, height, 0.75);
-    try_decode_luma(luma2, w2, h2, formats_hint)
+    // Upscale for small / distant codes
+    let (luma_up, w_up, h_up) = scale_luma(&luma, width, height, 1.35);
+    if let Some(frame) = try_decode_luma(luma_up, w_up, h_up, formats_hint) {
+        return Some(frame);
+    }
+
+    // Downscale fallback for oversized blurry frames
+    let (luma_dn, w_dn, h_dn) = scale_luma(&luma, width, height, 0.75);
+    try_decode_luma(luma_dn, w_dn, h_dn, formats_hint)
 }
 
 fn try_decode_luma(

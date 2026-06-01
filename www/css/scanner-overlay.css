@@ -9,7 +9,7 @@
   --rb-danger: #f87171;
   --rb-safe-top: env(safe-area-inset-top, 0px);
   --rb-safe-bottom: env(safe-area-inset-bottom, 0px);
-  --rb-frame-size: min(72vw, 280px);
+  --rb-frame-size: min(85vw, 320px);
 
   position: fixed;
   inset: 0;
@@ -45,6 +45,36 @@
   justify-content: space-between;
   gap: 12px;
   margin-bottom: 12px;
+}
+
+.rustbar-overlay__header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.rustbar-overlay__torch {
+  appearance: none;
+  border: 1px solid rgb(255 255 255 / 12%);
+  background: var(--rb-surface);
+  color: var(--rb-text);
+  padding: 10px 14px;
+  border-radius: 10px;
+  font-size: 0.85rem;
+  font-weight: 600;
+  cursor: pointer;
+  min-height: 44px;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.rustbar-overlay__torch[hidden] {
+  display: none;
+}
+
+.rustbar-overlay__torch--on {
+  background: #fbbf24;
+  color: #422006;
+  border-color: transparent;
 }
 
 .rustbar-overlay__title {

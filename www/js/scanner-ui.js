@@ -23,6 +23,7 @@ function ensureStyles() {
  *   status: HTMLElement;
  *   allowBtn: HTMLButtonElement;
  *   closeBtn: HTMLButtonElement;
+ *   torchBtn: HTMLButtonElement;
  *   destroy: () => void;
  * }}
  */
@@ -32,11 +33,16 @@ export function createScannerOverlay() {
   const root = document.createElement("div");
   root.className = "rustbar-overlay";
   root.setAttribute("role", "dialog");
-  root.setAttribute("aria-label", "QR code scanner");
+  root.setAttribute("aria-label", "Barcode scanner");
   root.innerHTML = `
     <header class="rustbar-overlay__header">
       <h2 class="rustbar-overlay__title">Scan code</h2>
-      <button type="button" class="rustbar-overlay__close" data-rustbar-close>Close</button>
+      <div class="rustbar-overlay__header-actions">
+        <button type="button" class="rustbar-overlay__torch" hidden data-rustbar-torch aria-label="Flashlight">
+          Flash
+        </button>
+        <button type="button" class="rustbar-overlay__close" data-rustbar-close>Close</button>
+      </div>
     </header>
     <div class="rustbar-overlay__body">
       <div class="rustbar-overlay__viewport">
@@ -62,6 +68,7 @@ export function createScannerOverlay() {
   const status = root.querySelector(".rustbar-overlay__status");
   const allowBtn = root.querySelector("[data-rustbar-allow]");
   const closeBtn = root.querySelector("[data-rustbar-close]");
+  const torchBtn = root.querySelector("[data-rustbar-torch]");
 
   function destroy() {
     root.remove();
@@ -70,7 +77,7 @@ export function createScannerOverlay() {
     }
   }
 
-  return { root, video, status, allowBtn, closeBtn, destroy };
+  return { root, video, status, allowBtn, closeBtn, torchBtn, destroy };
 }
 
 /**
