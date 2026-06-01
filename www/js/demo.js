@@ -21,16 +21,19 @@ scanBtn.addEventListener("click", async () => {
         formatEl.hidden = false;
       }
     },
+    showStreamDebug: true,
     onCameraReady(info) {
       console.log(
         "Preview:",
         info.width,
         "x",
         info.height,
+        "| preview decode:",
+        info.previewRecognitionResolution,
+        "| still decode:",
+        info.recognitionResolution,
         "| max still width:",
         info.photoWidthMax || "n/a",
-        "| recognition:",
-        info.recognitionResolution,
         info,
       );
     },

@@ -56,20 +56,91 @@ function buildVideoConstraints(deviceId) {
 function buildUpgradeConstraints(deviceId) {
   const base = deviceId ? { deviceId: { exact: deviceId } } : {};
   const facing = { facingMode: { ideal: "environment" } };
+  const fps = { frameRate: FRAME_RATE_HINT };
   return [
     {
       ...base,
       ...facing,
+      ...fps,
       width: { min: 1920 },
       height: { min: 1080 },
     },
     {
       ...base,
       ...facing,
+      ...fps,
       width: { ideal: 1920 },
       height: { ideal: 1080 },
     },
   ];
+}
+
+/** Pick width×height from track capabilities (16:9 ladder). */
+function resolutionLadder(caps) {
+  const maxW = caps?.width?.max ?? 1920;
+  const candidates = [
+    [3840, 2160],
+    [1920, 1080],
+    [1280, 720],
+    [960, 540],
+  ];
+  return candidates.filter(([w]) => w <= maxW);
+}
+
+/**
+ * After initial stream, retry with best resolution from capabilities.
+ */
+export async function upgradeStreamFromCapabilities(
+  stream,
+  videoEl,
+  minWidth = DEFAULT_MIN_WIDTH,
+) {
+  const track = stream?.getVideoTracks()?.[0];
+  if (!track) return stream;
+
+  const settings = track.getSettings?.() ?? {};
+  if ((settings.width ?? 0) >= minWidth) {
+    await applyResizeModeNone(stream);
+    return stream;
+  }
+
+  const deviceId = settings.deviceId;
+  const caps = track.getCapabilities?.();
+  const ladder = resolutionLadder(caps);
+
+  for (const t of stream.getTracks()) t.stop();
+
+  for (const [w, h] of ladder) {
+    if (w < minWidth) continue;
+    try {
+      const base = deviceId ? { deviceId: { exact: deviceId } } : {};
+      const next = await navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: {
+          ...base,
+          facingMode: { ideal: "environment" },
+          frameRate: FRAME_RATE_HINT,
+          width: { ideal: w },
+          height: { ideal: h },
+        },
+      });
+      videoEl.srcObject = next;
+      await videoEl.play().catch(() => {});
+      await applyResizeModeNone(next);
+      await applyCameraEnhancements(next, undefined);
+      const nw = next.getVideoTracks()[0]?.getSettings?.()?.width ?? 0;
+      if (nw >= minWidth) return next;
+      for (const t of next.getTracks()) t.stop();
+    } catch {
+      /* try next size */
+    }
+  }
+
+  const fallback = await openCameraStream(deviceId);
+  videoEl.srcObject = fallback;
+  await videoEl.play().catch(() => {});
+  await applyCameraEnhancements(fallback, undefined);
+  return fallback;
 }
 
 export async function openCameraStream(deviceId, constraintList) {
@@ -228,7 +299,6 @@ export async function maybeRepickCamera(stream, _prefer4K, videoEl) {
   videoEl.srcObject = next;
   await videoEl.play().catch(() => {});
   await applyCameraEnhancements(next, undefined);
-  syncNativeVideoSize(videoEl);
   return next;
 }
 
@@ -249,14 +319,12 @@ export async function upgradeStreamIfLow(stream, videoEl, minWidth = DEFAULT_MIN
     videoEl.srcObject = next;
     await videoEl.play().catch(() => {});
     await applyCameraEnhancements(next, undefined);
-    syncNativeVideoSize(videoEl);
     return next;
   } catch {
     const fallback = await openCameraStream(deviceId);
     videoEl.srcObject = fallback;
     await videoEl.play().catch(() => {});
     await applyCameraEnhancements(fallback, undefined);
-    syncNativeVideoSize(videoEl);
     return fallback;
   }
 }

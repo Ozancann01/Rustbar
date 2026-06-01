@@ -206,6 +206,25 @@
   display: none;
 }
 
+.rustbar-overlay__debug {
+  position: fixed;
+  top: calc(56px + var(--rb-safe-top));
+  left: 12px;
+  z-index: 3;
+  margin: 0;
+  padding: 4px 8px;
+  border-radius: 6px;
+  font-size: 0.7rem;
+  font-family: ui-monospace, monospace;
+  color: #a1a1aa;
+  background: rgb(0 0 0 / 55%);
+  pointer-events: none;
+}
+
+.rustbar-overlay__debug[hidden] {
+  display: none;
+}
+
 .rustbar-overlay__allow {
   position: fixed;
   left: 50%;

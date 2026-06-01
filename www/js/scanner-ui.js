@@ -31,6 +31,7 @@ function ensureStyles() {
  *   resultText: HTMLElement;
  *   resultCloseBtn: HTMLButtonElement;
  *   resultCopyBtn: HTMLButtonElement;
+ *   debugEl: HTMLElement;
  *   destroy: () => void;
  * }}
  */
@@ -57,6 +58,7 @@ export function createScannerOverlay() {
       <span class="rustbar-overlay__corner rustbar-overlay__corner--br"></span>
     </div>
     <p class="rustbar-overlay__status" role="status">Starting camera…</p>
+    <p class="rustbar-overlay__debug" hidden data-rustbar-debug></p>
     <button type="button" class="rustbar-overlay__allow" hidden data-rustbar-allow>Allow camera</button>
     <div class="rustbar-overlay__result" hidden data-rustbar-result>
       <div class="rustbar-overlay__result-row">
@@ -90,6 +92,7 @@ export function createScannerOverlay() {
     resultText: root.querySelector("[data-rustbar-text]"),
     resultCloseBtn: root.querySelector("[data-rustbar-result-close]"),
     resultCopyBtn: root.querySelector("[data-rustbar-result-copy]"),
+    debugEl: root.querySelector("[data-rustbar-debug]"),
     destroy() {
       root.remove();
       if (!document.querySelector(".rustbar-overlay")) {
@@ -134,4 +137,11 @@ export function showResultSheet(ui, result) {
 export function hideResultSheet(ui) {
   ui.resultPanel.hidden = true;
   ui.finderHint.hidden = false;
+}
+
+/** @param {object} ui @param {string} text */
+export function setStreamDebug(ui, text) {
+  if (!ui.debugEl) return;
+  ui.debugEl.textContent = text;
+  ui.debugEl.hidden = !text;
 }

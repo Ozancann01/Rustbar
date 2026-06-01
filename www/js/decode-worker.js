@@ -1,8 +1,12 @@
 /**
- * WASM worker — all image processing and decode run in Rust.
+ * WASM worker — decode runs off the main thread for smooth video preview.
  */
 
-import init, { decodeVideoFrame, decodeImageBytes } from "../pkg/rustbar_scanner.js";
+import init, {
+  decodeVideoFrame,
+  decodeFrameRgba,
+  decodeImageBytes,
+} from "../pkg/rustbar_scanner.js";
 
 const wasmReady = init();
 
@@ -19,27 +23,15 @@ self.onmessage = async (event) => {
     return;
   }
 
-  if (type === "decode") {
-    const {
-      id,
-      buffer,
-      frameWidth,
-      frameHeight,
-      roiFraction,
-      targetSize,
-      formatsHint,
-    } = event.data;
+  if (type === "decodeFrame") {
+    const { id, buffer, width, height, targetSize, formatsHint } = event.data;
     try {
       await wasmReady;
       const rgba = new Uint8Array(buffer);
-      const result = decodeVideoFrame(
-        rgba,
-        frameWidth,
-        frameHeight,
-        roiFraction,
-        targetSize,
-        formatsHint,
-      );
+      const result =
+        targetSize > 0 && targetSize !== width
+          ? decodeVideoFrame(rgba, width, height, 1.0, targetSize, formatsHint)
+          : decodeFrameRgba(rgba, width, height, formatsHint);
       self.postMessage({
         type: "result",
         id,

@@ -1,5 +1,7 @@
 //! Shared barcode decode pipeline for WASM and native mobile.
 
+pub mod session;
+
 use rxing::helpers::detect_in_luma_filtered_with_hints;
 use rxing::BarcodeFormat;
 use rxing::DecodeHints;

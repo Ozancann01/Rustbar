@@ -16,19 +16,18 @@ Uses the browser’s **native camera APIs** (`getUserMedia`, `ImageCapture`, `Me
 |------|-----------------|---------|
 | Decoder | Proprietary WASM | **rxing** (open source; different accuracy ceiling) |
 | Preview UI | Full-screen, large finder | Full-bleed overlay + large finder |
-| Stream | Optional 4K + constraints | `use4KStream` + upgrade ladder |
+| Stream | Optional 4K + constraints | `use4KStream` + capability-based upgrade |
 | Stills | `ImageCapture` | Mobile-first still (~800ms), 350ms interval |
 | After scan | Result card | Optional `showResultSheet` (default on mobile) |
 
 ## Features
 
 - **One-browser embed** — GitHub Pages, your site, or local HTTPS
-- **Rust decode** — bilinear ROI crop, multi-scale + rotation (preview 90°; stills +270°)
-- **Scan pipeline** — throttled preview (~14 Hz) → focus hint → max-res still (`detect → lock → snap`)
-- **High-res camera** — 4K→1080p→min-1080p ladder, stream upgrade, `resizeMode: none`
-- **ImageCapture** — mobile early still, periodic / miss-triggered JPEG decode
-- **Web Worker** — WASM off main thread; torch in overlay
-- **Chrome fast path** — `BarcodeDetector` on center finder crop (~1200px) for QR-only
+- **Rust decode + session** — scan timing, ROI expand, hit confirm in `rustbar-core`; WASM `ScanSession`
+- **Smooth preview** — small finder crop (~640px), `requestVideoFrameCallback`, WASM in **Web Worker** (do not disable on mobile)
+- **Sharp stream** — capability ladder (up to 1080p/4K), `resizeMode: none`; no full-frame canvas read on the video element
+- **ImageCapture** — timer stills without focus interrupt; focus hint only after decode misses
+- **Chrome fast path** — `BarcodeDetector` on center finder crop for QR-only
 
 ## Build
 
@@ -50,7 +49,7 @@ Open [http://localhost:8080](http://localhost:8080) (use HTTPS or localhost for 
 
 Copy into your static host:
 
-- `www/js/rustbar.js`, `camera.js`, `capture.js`, `scan-state.js`, `decode-worker.js`, `scanner-ui.js`
+- `www/js/rustbar.js`, `camera.js`, `capture.js`, `decode-worker.js`, `scanner-ui.js`
 - `www/css/scanner-overlay.css`
 - `www/pkg/` (from `./build.sh`)
 
@@ -65,6 +64,7 @@ await RustbarScanner.open({
   recognitionResolution: 2048,
   onCameraReady(info) {
     console.log("preview", info.width, "x", info.height);
+    console.log("preview decode", info.previewRecognitionResolution);
     console.log("max still width", info.photoWidthMax);
   },
 });
@@ -75,47 +75,50 @@ await RustbarScanner.open({
 | Option | Default | Description |
 |--------|---------|-------------|
 | `onScan` | required | `(text, format) => void` |
-| `onCameraReady` | — | `width`, `height`, `frameRate`, `imageCapture`, `photoWidthMax`, `recognitionResolution` |
+| `onCameraReady` | — | `width`, `height`, `photoWidthMax`, `recognitionResolution`, `previewRecognitionResolution` |
 | `prefer4K` | `true` | Stronger `getUserMedia` constraints |
-| `use4KStream` | `true` when `prefer4K` | Re-negotiate stream if width &lt; 1920 |
-| `recognitionResolution` | `2048` | Decode size: `1536` / `2048` / `2560` (like Scanbot `setRecognitionResolution`) |
-| `decodeResolution` | — | Alias for `recognitionResolution` |
+| `use4KStream` | `true` when `prefer4K` | Re-negotiate from track capabilities if width &lt; 1920 |
+| `recognitionResolution` | `2048` | Still / full JPEG decode size (`1536` / `2048` / `2560`) |
+| `previewRecognitionResolution` | `1536` on mobile | Live preview decode target (lighter) |
 | `highResStills` | `true` if supported | `ImageCapture` on timer / after misses |
 | `stillIntervalMs` | `350` mobile, `500` desktop | Min ms between still captures |
 | `mobileStillFirst` | `true` on mobile | Defer preview decode ~800ms; fire early still |
 | `showResultSheet` | `true` on mobile | Bottom card with thumbnail, Copy / Close |
-| `roiFraction` | `0.85` | Center crop (auto-expands to `0.92` after misses) |
+| `showStreamDebug` | `false` | Overlay label with negotiated `width×height` |
+| `roiFraction` | `0.85` | Center crop (auto-expands to `0.92` in Rust session) |
 | `adaptiveDecode` | `false` | Drop to 1536px after slow frames if `true` |
-| `useWorker` | `true` | WASM in Web Worker |
+| `useWorker` | `true` | **Keep enabled** on phones for smooth video |
 | `continuous` / `closeOnScan` | `false` / `true` | Session behavior |
 
 ## Mobile test checklist (Brave / Chrome, HTTPS)
 
 | Test | Expected |
 |------|----------|
-| Open demo | Full-screen video, large finder (not a small boxed preview) |
-| `onCameraReady` | `width` ≥ 1280 when the device allows; `photoWidthMax` &gt; preview width when `ImageCapture` works |
+| Open demo | Full-screen video, large finder; preview **smooth** when panning |
+| `onCameraReady` | `width` ≥ 1280 when the device allows; `photoWidthMax` &gt; preview width |
+| `showStreamDebug: true` | Top-left shows e.g. `1920×1080 @ 30fps` |
 | Small QR ~40cm | Still capture within ~1s; decode succeeds |
 | After scan | Result sheet with format + text (if `showResultSheet`) |
-| vs Scanbot web demo | Similar sharp preview; tiny/damaged codes may differ (rxing vs proprietary engine) |
 
 ## Architecture
 
 ```
-www/js/rustbar.js      # API + scan state machine
+www/js/rustbar.js      # Camera/DOM glue + rVFC loop
+www/js/decode-worker.js # WASM decode off main thread
 www/js/camera.js       # getUserMedia, focus hints, torch
 www/js/capture.js      # ImageCapture takePhoto / grabFrame
-crates/rustbar-core/   # rxing decode pipeline
-scanner/               # wasm-bindgen → www/pkg
+crates/rustbar-core/   # Decode pipeline + ScanSession state machine
+scanner/               # wasm-bindgen → www/pkg (ScanSession, decode_*)
 ```
 
 ## WASM exports
 
 | Export | Description |
 |--------|-------------|
-| `decodeVideoFrame` | Main live path — ROI crop + decode |
-| `decodeImageBytes` | JPEG/PNG still (capped at 4096px, +270° rotation) |
+| `ScanSession` | Timing, ROI, hit confirmation (replaces JS state machine) |
+| `decodeVideoFrame` | ROI crop + decode (still used for scaled crops) |
 | `decodeFrameRgba` | Pre-sized RGBA square |
+| `decodeImageBytes` | JPEG/PNG still (capped at 4096px, +270° rotation) |
 
 ## License
 
