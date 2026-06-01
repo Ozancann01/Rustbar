@@ -5,16 +5,23 @@
 import init, { decodeFrameRgba } from "../pkg/rustbar_scanner.js";
 import { createScannerOverlay, setOverlayStatus } from "./scanner-ui.js";
 
-const DECODE_SIZE = 1024;
+const DEFAULT_DECODE_RESOLUTION = 2048;
+const FAST_DECODE_RESOLUTION = 1536;
 const ROI_FRACTION = 0.72;
-const CONFIRM_FRAMES = 2;
+const CONFIRM_FRAMES = 1;
+const DECODE_SLOW_MS = 50;
 const DEFAULT_FORMATS = ["qrcode", "datamatrix"];
+
+const BAD_CAMERA_RE =
+  /telephoto|ultra\s*wide|ultrawide|0\.5x|fish|macro|depth/i;
+const GOOD_CAMERA_RE = /back|rear|environment|wide|camera\s*2|main/i;
 
 let wasmInitPromise = null;
 let activeSession = null;
 
 const captureCanvas = document.createElement("canvas");
 const captureCtx = captureCanvas.getContext("2d", { willReadFrequently: true });
+captureCtx.imageSmoothingEnabled = false;
 
 async function ensureWasm() {
   if (!wasmInitPromise) {
@@ -27,13 +34,65 @@ function formatsToHint(formats) {
   return formats.map((f) => f.trim().toLowerCase()).join(",");
 }
 
+function clampDecodeResolution(n) {
+  const v = Number(n) || DEFAULT_DECODE_RESOLUTION;
+  return Math.min(2048, Math.max(1024, Math.round(v / 256) * 256));
+}
+
+/**
+ * Pick the best rear wide camera (avoid telephoto / ultrawide).
+ */
 async function pickCameraDevice() {
   const devices = await navigator.mediaDevices.enumerateDevices();
   const cams = devices.filter((d) => d.kind === "videoinput");
-  const back =
-    cams.find((d) => /back|rear|environment/i.test(d.label)) ??
-    cams[cams.length - 1];
-  return back?.deviceId;
+  if (cams.length === 0) return undefined;
+
+  const scored = cams.map((cam) => {
+    const label = (cam.label || "").toLowerCase();
+    let score = 0;
+    if (GOOD_CAMERA_RE.test(label)) score += 10;
+    if (BAD_CAMERA_RE.test(label)) score -= 20;
+    if (/front|user|selfie|face/i.test(label)) score -= 30;
+    return { cam, score };
+  });
+
+  scored.sort((a, b) => b.score - a.score);
+  const best = scored.find((s) => s.score > -10) ?? scored[0];
+  return best?.cam.deviceId;
+}
+
+function buildVideoConstraints(deviceId, prefer4K) {
+  const base = deviceId ? { deviceId: { exact: deviceId } } : {};
+  const facing = { facingMode: { ideal: "environment" } };
+
+  if (prefer4K) {
+    return [
+      { ...base, ...facing, width: { ideal: 3840 }, height: { ideal: 2160 } },
+      { ...base, ...facing, width: { ideal: 1920 }, height: { ideal: 1080 } },
+      { ...facing, width: { ideal: 1920 }, height: { ideal: 1080 } },
+      { facingMode: "environment" },
+    ];
+  }
+
+  return [
+    { ...base, ...facing, width: { ideal: 3840 }, height: { ideal: 2160 } },
+    { ...base, ...facing, width: { ideal: 1920 }, height: { ideal: 1080 } },
+    { ...facing, width: { ideal: 1920 }, height: { ideal: 1080 } },
+    { facingMode: "environment" },
+  ];
+}
+
+async function openCameraStream(deviceId, prefer4K) {
+  const attempts = buildVideoConstraints(deviceId, prefer4K);
+  let lastErr;
+  for (const video of attempts) {
+    try {
+      return await navigator.mediaDevices.getUserMedia({ audio: false, video });
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr ?? new Error("Could not open camera");
 }
 
 function vibrateOnScan() {
@@ -45,9 +104,11 @@ function vibrateOnScan() {
  * @property {(text: string, format: string) => void} onScan
  * @property {(error: Error) => void} [onError]
  * @property {(lastText?: string) => void} [onClose]
- * @property {string[]} [formats] - e.g. ["qrcode", "datamatrix"]
- * @property {boolean} [continuous=false]
- * @property {boolean} [closeOnScan=true]
+ * @property {string[]} [formats]
+ * @property {number} [decodeResolution] - 1024 | 1536 | 2048
+ * @property {boolean} [prefer4K]
+ * @property {boolean} [continuous]
+ * @property {boolean} [closeOnScan]
  */
 
 class ScannerSessionImpl {
@@ -55,10 +116,16 @@ class ScannerSessionImpl {
     this.options = options;
     this.formats = options.formats?.length ? options.formats : DEFAULT_FORMATS;
     this.formatsHint = formatsToHint(this.formats);
+    this.decodeResolution = clampDecodeResolution(
+      options.decodeResolution ?? DEFAULT_DECODE_RESOLUTION,
+    );
+    this.prefer4K = options.prefer4K ?? false;
     this.closed = false;
     this.stream = null;
     this.scanning = false;
     this.decodeInFlight = false;
+    this.skipNextFrame = false;
+    this.frameIndex = 0;
     this.rafId = null;
     this.pendingHit = null;
     this.confirmCount = 0;
@@ -103,6 +170,8 @@ class ScannerSessionImpl {
     }
     this.scanning = false;
     this.decodeInFlight = false;
+    this.skipNextFrame = false;
+    this.frameIndex = 0;
     this.pendingHit = null;
     this.confirmCount = 0;
   }
@@ -112,16 +181,23 @@ class ScannerSessionImpl {
     this.scanning = true;
     const tick = () => {
       if (!this.scanning || this.closed) return;
-      if (!this.decodeInFlight) {
+      if (!this.decodeInFlight && !this.skipNextFrame) {
         this._tryDecodeFrame();
       }
+      this.skipNextFrame = false;
       this.rafId = requestAnimationFrame(tick);
     };
     this.rafId = requestAnimationFrame(tick);
   }
 
+  _currentDecodeSize() {
+    this.frameIndex += 1;
+    const useFull = this.frameIndex % 3 === 0;
+    return useFull ? this.decodeResolution : FAST_DECODE_RESOLUTION;
+  }
+
   /** Crop center square (viewfinder) and scale for decode. */
-  _captureRoiImageData(video) {
+  _captureRoiImageData(video, decodeSize) {
     const vw = video.videoWidth;
     const vh = video.videoHeight;
     if (!vw || !vh) return null;
@@ -130,27 +206,35 @@ class ScannerSessionImpl {
     const sx = Math.floor((vw - side) / 2);
     const sy = Math.floor((vh - side) / 2);
 
-    captureCanvas.width = DECODE_SIZE;
-    captureCanvas.height = DECODE_SIZE;
-    captureCtx.drawImage(video, sx, sy, side, side, 0, 0, DECODE_SIZE, DECODE_SIZE);
-    return captureCtx.getImageData(0, 0, DECODE_SIZE, DECODE_SIZE);
+    captureCanvas.width = decodeSize;
+    captureCanvas.height = decodeSize;
+    captureCtx.imageSmoothingEnabled = false;
+    captureCtx.drawImage(video, sx, sy, side, side, 0, 0, decodeSize, decodeSize);
+    return captureCtx.getImageData(0, 0, decodeSize, decodeSize);
   }
 
   _tryDecodeFrame() {
     const video = this.ui?.video;
     if (!video || video.readyState < 2) return;
 
-    const imageData = this._captureRoiImageData(video);
+    const decodeSize = this._currentDecodeSize();
+    const imageData = this._captureRoiImageData(video, decodeSize);
     if (!imageData) return;
 
     this.decodeInFlight = true;
+    const t0 = performance.now();
     try {
       const result = decodeFrameRgba(
         imageData.data,
-        DECODE_SIZE,
-        DECODE_SIZE,
+        decodeSize,
+        decodeSize,
         this.formatsHint,
       );
+
+      const elapsed = performance.now() - t0;
+      if (elapsed > DECODE_SLOW_MS) {
+        this.skipNextFrame = true;
+      }
 
       if (!result) {
         this.pendingHit = null;
@@ -220,7 +304,17 @@ class ScannerSessionImpl {
           exposureMode: "continuous",
         });
       } catch {
-        /* unsupported on this device */
+        /* unsupported */
+      }
+    }
+
+    const caps = track.getCapabilities?.();
+    if (caps?.zoom) {
+      const zoom = Math.min(1.2, caps.zoom.max ?? 1.2);
+      try {
+        await track.applyConstraints({ advanced: [{ zoom }] });
+      } catch {
+        /* optional */
       }
     }
   }
@@ -239,34 +333,18 @@ class ScannerSessionImpl {
     if (this.ui.allowBtn) this.ui.allowBtn.hidden = true;
 
     const deviceId = await pickCameraDevice().catch(() => undefined);
-    const constraints = {
-      audio: false,
-      video: {
-        facingMode: { ideal: "environment" },
-        width: { ideal: 1920 },
-        height: { ideal: 1080 },
-        ...(deviceId ? { deviceId: { exact: deviceId } } : {}),
-      },
-    };
 
     try {
-      this.stream = await navigator.mediaDevices.getUserMedia(constraints);
-    } catch (firstErr) {
-      try {
-        this.stream = await navigator.mediaDevices.getUserMedia({
-          audio: false,
-          video: { facingMode: "environment" },
-        });
-      } catch (secondErr) {
-        const err = /** @type {Error} */ (secondErr || firstErr);
-        this._setStatus(
-          err.message || "Could not access camera — use HTTPS",
-          "error",
-        );
-        this._showAllowFallback();
-        this.options.onError?.(err);
-        return;
-      }
+      this.stream = await openCameraStream(deviceId, this.prefer4K);
+    } catch (err) {
+      const error = err instanceof Error ? err : new Error(String(err));
+      this._setStatus(
+        error.message || "Could not access camera — use HTTPS",
+        "error",
+      );
+      this._showAllowFallback();
+      this.options.onError?.(error);
+      return;
     }
 
     const video = this.ui.video;
@@ -280,6 +358,14 @@ class ScannerSessionImpl {
     });
     await video.play().catch(() => {});
     await this._applyCameraEnhancements();
+
+    const track = this.stream.getVideoTracks()[0];
+    const settings = track?.getSettings?.();
+    if (settings?.width && settings?.height) {
+      console.debug(
+        `Rustbar camera: ${settings.width}×${settings.height} decode=${this.decodeResolution}`,
+      );
+    }
 
     this._startScanLoop();
     this._setStatus("Point at a QR or Data Matrix code", "scanning");

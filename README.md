@@ -6,7 +6,8 @@ Embeddable browser library: call **`RustbarScanner.open()`** and it opens the ca
 
 - **Library API** — `init()`, `open()`, `close()` with `onScan(text, format)` / `onError` callbacks
 - **Formats** — QR Code and Data Matrix (more symbologies later via `formats` option)
-- **Strong decode** — rxing with `TryHarder` + inverted detection; center ROI crop at 1024px
+- **Strong decode** — rxing filtered binarizer, multi-scale WASM pass, center ROI up to 2048px
+- **High-res camera** — up to 4K stream when available; smart rear wide camera selection
 - **Live scan** — `requestAnimationFrame` loop with 2-frame confirmation (stable auto-detect)
 - **Mobile** — rear camera, continuous focus/exposure when supported, `playsinline` for iOS
 
@@ -33,14 +34,7 @@ python -m http.server 8080
 
 Open [http://localhost:8080](http://localhost:8080) and tap **Scan QR code**.
 
-## Deploy to GitHub Pages
-
-The repo includes [`.github/workflows/pages.yml`](.github/workflows/pages.yml). On each push to `main` (or `master`), it builds WASM and publishes the `www/` folder.
-
-1. Push this repo to GitHub.
-2. **Settings → Pages → Build and deployment** → Source: **GitHub Actions**.
-3. After the workflow succeeds, open your site (e.g. `https://ozancann01.github.io/Rustbar/`).
-4. On your phone, open that HTTPS URL and tap **Scan QR code**.
+Demo: [https://ozancann01.github.io/Rustbar/](https://ozancann01.github.io/Rustbar/) (deployed via GitHub Actions; see [`.github/workflows/pages.yml`](.github/workflows/pages.yml)).
 
 ## Library usage
 
@@ -89,6 +83,8 @@ Copy these paths into your project (or serve them statically):
 | `onError` | `(err: Error) => void` | — | Camera / permission / WASM errors |
 | `onClose` | `(lastText?: string) => void` | — | When overlay is closed |
 | `formats` | `string[]` | `["qrcode","datamatrix"]` | Symbologies to search for |
+| `decodeResolution` | `number` | `2048` | Decode canvas size (`1024`, `1536`, or `2048`) |
+| `prefer4K` | `boolean` | `false` | Prefer 4K camera stream (more CPU; sharper small codes) |
 | `continuous` | `boolean` | `false` | Keep scanning after each result |
 | `closeOnScan` | `boolean` | `true` | Close overlay after first scan (when `continuous` is false) |
 

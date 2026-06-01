@@ -1,6 +1,6 @@
 //! Barcode decoder for browsers — QR + Data Matrix via rxing (ZXing).
 
-use rxing::helpers::detect_in_luma_with_hints;
+use rxing::helpers::detect_in_luma_filtered_with_hints;
 use rxing::BarcodeFormat;
 use rxing::DecodeHints;
 use rxing::RXingResult;
@@ -44,7 +44,7 @@ pub fn decode_frame_rgba(
     }
 
     let luma = rgba_to_luma_vec(data, width, height);
-    decode_luma_bytes(luma, width, height, formats_hint)
+    decode_luma_multiscale(luma, width, height, formats_hint)
 }
 
 /// Decode from PNG/JPEG/WebP bytes.
@@ -52,7 +52,7 @@ pub fn decode_frame_rgba(
 pub fn decode_image_bytes(bytes: &[u8], formats_hint: &str) -> Option<FrameDecodeResult> {
     let img = image::load_from_memory(bytes).ok()?.to_luma8();
     let (width, height) = img.dimensions();
-    decode_luma_bytes(img.into_raw(), width, height, formats_hint)
+    decode_luma_multiscale(img.into_raw(), width, height, formats_hint)
 }
 
 /// Backward-compatible alias (text only).
@@ -76,7 +76,51 @@ fn rgba_to_luma_vec(rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
     luma
 }
 
-fn decode_luma_bytes(
+fn contrast_stretch(luma: &mut [u8]) {
+    let min = luma.iter().copied().min().unwrap_or(0);
+    let max = luma.iter().copied().max().unwrap_or(255);
+    if max <= min {
+        return;
+    }
+    let range = (max - min) as f32;
+    for p in luma.iter_mut() {
+        *p = (((*p - min) as f32 / range) * 255.0).round() as u8;
+    }
+}
+
+fn downscale_luma(luma: &[u8], width: u32, height: u32, scale: f32) -> (Vec<u8>, u32, u32) {
+    let nw = ((width as f32) * scale).max(64.0) as u32;
+    let nh = ((height as f32) * scale).max(64.0) as u32;
+    let mut out = Vec::with_capacity((nw * nh) as usize);
+    for y in 0..nh {
+        let sy = (y as f32 / nh as f32 * height as f32) as u32;
+        let sy = sy.min(height.saturating_sub(1));
+        for x in 0..nw {
+            let sx = (x as f32 / nw as f32 * width as f32) as u32;
+            let sx = sx.min(width.saturating_sub(1));
+            out.push(luma[(sy * width + sx) as usize]);
+        }
+    }
+    (out, nw, nh)
+}
+
+fn decode_luma_multiscale(
+    mut luma: Vec<u8>,
+    width: u32,
+    height: u32,
+    formats_hint: &str,
+) -> Option<FrameDecodeResult> {
+    contrast_stretch(&mut luma);
+
+    if let Some(frame) = try_decode_luma(luma.clone(), width, height, formats_hint) {
+        return Some(frame);
+    }
+
+    let (luma2, w2, h2) = downscale_luma(&luma, width, height, 0.75);
+    try_decode_luma(luma2, w2, h2, formats_hint)
+}
+
+fn try_decode_luma(
     luma: Vec<u8>,
     width: u32,
     height: u32,
@@ -90,7 +134,8 @@ fn decode_luma_bytes(
         hints.PossibleFormats = Some(formats);
     }
 
-    let result = detect_in_luma_with_hints(luma, width, height, None, &mut hints).ok()?;
+    let result =
+        detect_in_luma_filtered_with_hints(luma, width, height, None, &mut hints).ok()?;
     Some(result_to_frame(result))
 }
 
